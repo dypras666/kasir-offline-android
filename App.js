@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { 
   StyleSheet, Text, View, TextInput, TouchableOpacity, 
-  Alert, ActivityIndicator, Dimensions, Animated, Platform
+  Alert, ActivityIndicator, Dimensions, Animated, Platform,
+  ScrollView, Modal
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import * as SecureStore from 'expo-secure-store';
@@ -92,8 +93,10 @@ const TransferItem = React.memo(({ item, onAccept, userRole }) => (
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [serverMode, setServerMode] = useState('cloud'); // 'cloud' or 'local'
-  const [localServerIp, setLocalServerIp] = useState('');
+  const [serverMode, setServerMode] = useState('local'); // Force local mode
+  const [branches, setBranches] = useState([]);
+  const [selectedBranch, setSelectedBranch] = useState(null);
+  const [localServerIp, setLocalServerIp] = useState('192.168.1.250:8081');
   const [localServerName, setLocalServerName] = useState('');
   const [serverConnected, setServerConnected] = useState(false);
   const [user, setUser] = useState(null);
@@ -118,11 +121,16 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [transferFilter, setTransferFilter] = useState('pending'); // pending, completed, all
   const [transferSource, setTransferSource] = useState('all'); // all, or source name
+  const [transferDateFilter, setTransferDateFilter] = useState('all'); // all, today, month
   const [activeTab, setActiveTab] = useState('dashboard');
   const [dateFilter, setDateFilter] = useState('today');
   const [omset, setOmset] = useState(0);
   const [isSplashVisible, setIsSplashVisible] = useState(true);
   const splashOpacity = useMemo(() => new Animated.Value(1), []);
+  const [showStockModal, setShowStockModal] = useState(false);
+  const [stockSearch, setStockSearch] = useState('');
+  const [todayCount, setTodayCount] = useState(0);
+  const [recentSales, setRecentSales] = useState([]);
 
   useEffect(() => {
     initDB();
@@ -174,7 +182,24 @@ export default function App() {
       setServerConnected(true); // Default cloud is connected
     }
 
-    if (savedIp) setLocalServerIp(savedIp);
+    if (savedIp) {
+      setLocalServerIp(savedIp);
+      // Auto-fetch branches if IP exists
+      try {
+        let cleanIp = savedIp.replace(/^(http:\/\/|https:\/\/)/, '').replace(/\/$/, '');
+        const branchResp = await axios.get(`http://${cleanIp}/api/v1/branches`);
+        setBranches(branchResp.data || []);
+        const savedBranchId = await Storage.getItemAsync('selected_branch_id');
+        if (savedBranchId && branchResp.data) {
+          const found = branchResp.data.find(b => b.id.toString() === savedBranchId);
+          if (found) setSelectedBranch(found);
+        } else if (branchResp.data && branchResp.data.length > 0) {
+          setSelectedBranch(branchResp.data[0]);
+        }
+      } catch (e) {
+        console.log("Auto fetch branches failed", e);
+      }
+    }
     if (savedServerName) {
       setLocalServerName(savedServerName);
       setServerConnected(true);
@@ -203,15 +228,22 @@ export default function App() {
       return;
     }
     setLoading(true);
-    // Remove protocol and slashes if present to ensure clean input
     let cleanIp = ip.replace(/^(http:\/\/|https:\/\/)/, '').replace(/\/$/, '');
     try {
       const resp = await axios.get(`http://${cleanIp}/api/v1/info`, { timeout: 5000 });
-      if (resp.data && resp.data.server_name) {
-        setLocalServerName(resp.data.server_name);
+      if (resp.data && resp.data.server) {
+        setLocalServerName(resp.data.server);
         setServerConnected(true);
-        await SecureStore.setItemAsync('local_server_name', resp.data.server_name);
-        Alert.alert('Sukses', `Terhubung ke: ${resp.data.server_name}`);
+        await Storage.setItemAsync('local_server_name', resp.data.server);
+        
+        // Fetch branches
+        const branchResp = await axios.get(`http://${cleanIp}/api/v1/branches`);
+        setBranches(branchResp.data || []);
+        if (branchResp.data && branchResp.data.length > 0) {
+          setSelectedBranch(branchResp.data[0]);
+        }
+        
+        Alert.alert('Sukses', `Terhubung ke: ${resp.data.server}`);
       } else {
         setServerConnected(false);
         Alert.alert('Gagal', 'Format data dari server salah.');
@@ -258,16 +290,17 @@ export default function App() {
       try {
         const token = localStorage.getItem('user_token');
         if (!token) return;
-        const resp = await axios.get(`${getBaseUrl()}/api/v1/products-sync`, {
+        const branchId = selectedBranch?.id || 1;
+        const resp = await axios.get(`${getBaseUrl()}/api/v1/products?branch_id=${branchId}`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         const mapped = resp.data.map(p => ({
           id: p.id.toString(),
           name: p.name,
-          modal_price: p.cost_price || 0,
-          sell_price: p.price || 0,
+          modal_price: 0,
+          sell_price: p.sell_price || 0,
           stock: p.stock || 0,
-          unit: p.units && p.units.length > 0 ? p.units[0].name : (p.unit?.name || 'Pcs')
+          unit: p.unit_name || 'Pcs'
         }));
         setProducts(mapped);
       } catch (e) {
@@ -277,32 +310,57 @@ export default function App() {
       const allRows = db.getAllSync('SELECT * FROM products');
       setProducts(allRows);
     }
-  }, [getBaseUrl]);
+  }, [getBaseUrl, selectedBranch]);
 
   const loadTransfers = useCallback(async () => {
-    if (Platform.OS === 'web') {
-      try {
-        const token = localStorage.getItem('user_token');
-        if (!token) return;
-        const resp = await axios.get(`${getBaseUrl()}/api/v1/stock-transfers`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        const mapped = resp.data.map(t => ({
-          id: t.id.toString(),
-          from_name: t.from_branch?.name || t.from_warehouse?.name || '?',
-          to_name: t.to_branch?.name || t.to_warehouse?.name || '?',
-          transfer_date: t.transfer_date,
-          status: t.status
-        }));
-        setTransfers(mapped);
-      } catch (e) {
-        console.error('Web API transfers load failed:', e);
+    try {
+      const token = await Storage.getItemAsync('user_token');
+      const branchId = selectedBranch?.id || user?.branch_id || 1;
+      
+      if (!token) {
+        if (Platform.OS !== 'web') {
+          const rows = db.getAllSync('SELECT * FROM stock_transfers');
+          setTransfers(rows);
+        }
+        return;
       }
-    } else {
-      const rows = db.getAllSync('SELECT * FROM stock_transfers');
-      setTransfers(rows);
+      // Selalu hit online database cloud (API_URL)
+      const resp = await axios.get(`${API_URL}/api/v1/stock-transfers?to_branch_id=${branchId}&branch_id=${branchId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 8000
+      });
+      const mapped = resp.data.map(t => ({
+        id: t.id.toString(),
+        from_name: t.from_branch?.name || t.from_warehouse?.name || '?',
+        to_name: t.to_branch?.name || t.to_warehouse?.name || '?',
+        transfer_date: t.transfer_date,
+        status: t.status
+      }));
+      setTransfers(mapped);
+
+      if (Platform.OS !== 'web') {
+        try {
+          db.withTransactionSync(() => {
+            db.execSync('DELETE FROM stock_transfers');
+            mapped.forEach(t => {
+              db.runSync(
+                'INSERT INTO stock_transfers (id, from_name, to_name, transfer_date, status) VALUES (?, ?, ?, ?, ?)',
+                [t.id, t.from_name, t.to_name, t.transfer_date, t.status]
+              );
+            });
+          });
+        } catch (dbErr) {
+          console.error('Cache transfers to DB failed:', dbErr);
+        }
+      }
+    } catch (e) {
+      console.warn('Realtime online transfers load failed, fallback to local:', e);
+      if (Platform.OS !== 'web') {
+        const rows = db.getAllSync('SELECT * FROM stock_transfers');
+        setTransfers(rows);
+      }
     }
-  }, [getBaseUrl]);
+  }, [selectedBranch, user]);
 
   const loadOmset = useCallback(async () => {
     if (Platform.OS === 'web') {
@@ -317,6 +375,28 @@ export default function App() {
       setOmset(result?.total || 0);
     }
   }, [dateFilter]);
+
+  const loadDashboardStats = useCallback(async () => {
+    if (Platform.OS === 'web') {
+      setTodayCount(0);
+      setRecentSales([]);
+      return;
+    }
+    try {
+      const countRow = db.getFirstSync("SELECT COUNT(*) as c FROM sales WHERE date(created_at) = date('now')");
+      setTodayCount(countRow?.c || 0);
+      const rows = db.getAllSync(
+        "SELECT id, total, payment_method, created_at FROM sales ORDER BY created_at DESC LIMIT 5"
+      );
+      setRecentSales(rows);
+    } catch (e) {
+      console.warn('loadDashboardStats error:', e);
+    }
+  }, []);
+
+  const lowStockProducts = useMemo(() => {
+    return products.filter(p => Number(p.stock) <= 5).slice(0, 10);
+  }, [products]);
 
   const scanPrinters = async () => {
     setIsScanning(true);
@@ -406,8 +486,11 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (isLoggedIn) loadOmset();
-  }, [loadOmset, isLoggedIn]);
+    if (isLoggedIn) {
+      loadOmset();
+      loadDashboardStats();
+    }
+  }, [loadOmset, loadDashboardStats, isLoggedIn, activeTab]);
 
   const handleLogin = async () => {
     if (!email || !password) return;
@@ -445,6 +528,9 @@ export default function App() {
       }
       
       setUser(resp.data.user);
+      if (resp.data.user.branch) {
+        setSelectedBranch(resp.data.user.branch);
+      }
       setIsLoggedIn(true);
       syncData(resp.data.token);
     } catch (e) {
@@ -473,74 +559,37 @@ export default function App() {
     try {
       const currentToken = token || (Platform.OS === 'web' ? localStorage.getItem('user_token') : await SecureStore.getItemAsync('user_token'));
       const base = getBaseUrl();
+      const branchId = selectedBranch?.id || user?.branch_id || 1;
       
-      // Sync Products
-      const prodResp = await axios.get(`${base}/api/v1/products-sync`, {
+      const prodResp = await axios.get(`${base}/api/v1/products?branch_id=${branchId}`, {
         headers: { Authorization: `Bearer ${currentToken}` }
       });
 
-      // Sync Transfers (only if not in local server mode or local supports it)
-      let transData = [];
-      try {
-        const transResp = await axios.get(`${base}/api/v1/stock-transfers`, {
-          headers: { Authorization: `Bearer ${currentToken}` }
-        });
-        transData = transResp.data;
-      } catch (e) { console.log('Transfers sync skipped/not supported') }
-
       if (Platform.OS === 'web') {
-        // Web loads live from API, just update state
         const mapped = prodResp.data.map(p => ({
           id: p.id.toString(),
           name: p.name,
-          modal_price: p.cost_price || 0,
-          sell_price: p.price || 0,
+          modal_price: 0,
+          sell_price: p.sell_price || 0,
           stock: p.stock || 0,
-          unit: p.units && p.units.length > 0 ? p.units[0].name : (p.unit?.name || 'Pcs')
+          unit: p.unit_name || 'Pcs'
         }));
         setProducts(mapped);
-        const transMapped = transData.map(t => ({
-          id: t.id.toString(),
-          from_name: t.from_branch?.name || t.from_warehouse?.name || '?',
-          to_name: t.to_branch?.name || t.to_warehouse?.name || '?',
-          transfer_date: t.transfer_date,
-          status: t.status
-        }));
-        setTransfers(transMapped);
       } else {
         db.withTransactionSync(() => {
           db.execSync('DELETE FROM products');
           db.execSync('DELETE FROM product_units');
           db.execSync('DELETE FROM product_stocks');
-          db.execSync('DELETE FROM stock_transfers');
-          db.execSync('DELETE FROM stock_transfer_items');
           
           prodResp.data.forEach(p => {
             db.runSync(
               'INSERT INTO products (id, name, modal_price, sell_price, stock, unit) VALUES (?, ?, ?, ?, ?, ?)',
-              p.id.toString(), p.name, p.cost_price || 0, p.price || 0, p.stock || 0, p.units && p.units.length > 0 ? p.units[0].name : (p.unit?.name || 'Pcs')
+              p.id.toString(), p.name, 0, p.sell_price || 0, p.stock || 0, p.unit_name || 'Pcs'
             );
-            if (p.units && p.units.length > 0) {
-              p.units.forEach(u => db.runSync('INSERT INTO product_units (id, product_id, name, conversion, price) VALUES (?, ?, ?, ?, ?)', u.id.toString(), p.id.toString(), u.name, u.conversion, u.price || 0));
-            }
-            if (p.stocks && p.stocks.length > 0) {
-              p.stocks.forEach(s => db.runSync('INSERT INTO product_stocks (id, product_id, branch_id, stock) VALUES (?, ?, ?, ?)', s.id.toString(), p.id.toString(), s.branch_id?.toString() || '0', s.stock || 0));
-            }
-          });
-
-          transData.forEach(t => {
-            db.runSync(
-              'INSERT INTO stock_transfers (id, from_name, to_name, transfer_date, status) VALUES (?, ?, ?, ?, ?)',
-              t.id.toString(), t.from_branch?.name || t.from_warehouse?.name || '?', t.to_branch?.name || t.to_warehouse?.name || '?', t.transfer_date, t.status
-            );
-            if (t.items && t.items.length > 0) {
-              t.items.forEach(ti => db.runSync('INSERT INTO stock_transfer_items (transfer_id, product_name, qty, unit_name) VALUES (?, ?, ?, ?)', t.id.toString(), ti.product?.name || '?', ti.qty, ti.unit?.name || 'Pcs'));
-            }
           });
         });
       }
       loadProducts();
-      loadTransfers();
       const now = new Date().toLocaleString();
       setSyncTime(now);
       await SecureStore.setItemAsync('last_sync', now);
@@ -662,14 +711,36 @@ export default function App() {
     return transfers.filter(t => {
       const matchStatus = transferFilter === 'all' || t.status === transferFilter;
       const matchSource = transferSource === 'all' || t.from_name === transferSource;
-      return matchStatus && matchSource;
+      
+      let matchDate = true;
+      if (transferDateFilter === 'today' && t.transfer_date) {
+        const today = new Date().toISOString().split('T')[0];
+        matchDate = t.transfer_date.startsWith(today);
+      } else if (transferDateFilter === 'month' && t.transfer_date) {
+        const thisMonth = new Date().toISOString().substring(0, 7);
+        matchDate = t.transfer_date.startsWith(thisMonth);
+      }
+
+      return matchStatus && matchSource && matchDate;
     });
-  }, [transfers, transferFilter, transferSource]);
+  }, [transfers, transferFilter, transferSource, transferDateFilter]);
 
   const sources = useMemo(() => {
     const s = new Set(transfers.map(t => t.from_name));
     return ['all', ...Array.from(s)];
   }, [transfers]);
+
+  const transferStats = useMemo(() => {
+    return {
+      total: transfers.length,
+      pending: transfers.filter(t => t.status === 'pending').length,
+      completed: transfers.filter(t => t.status === 'completed' || t.status === 'diproses' || t.status === 'selesai').length,
+    };
+  }, [transfers]);
+
+  const filteredStockProducts = useMemo(() => {
+    return products.filter(p => p.name.toLowerCase().includes(stockSearch.toLowerCase()));
+  }, [products, stockSearch]);
 
   if (isSplashVisible) {
     return (
@@ -686,92 +757,76 @@ export default function App() {
         <Image source={require('./assets/icon.png')} style={styles.logo} contentFit="contain" />
         <Text style={styles.title}>KasirQu</Text>
 
-        <View style={styles.modeContainer}>
-          <TouchableOpacity 
-            style={[styles.modeBtn, serverMode === 'cloud' && styles.activeModeBtn]}
-            onPress={async () => {
-              setServerMode('cloud');
-              setServerConnected(true);
-              await SecureStore.setItemAsync('server_mode', 'cloud');
-            }}
-          >
-            <Text style={[styles.modeBtnText, serverMode === 'cloud' && styles.activeModeBtnText]}>Cloud</Text>
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={[styles.modeBtn, serverMode === 'local' && styles.activeModeBtn]}
-            onPress={async () => {
-              setServerMode('local');
-              setServerConnected(false); // Reset to false until test succeeds
-              await SecureStore.setItemAsync('server_mode', 'local');
-            }}
-          >
-            <Text style={[styles.modeBtnText, serverMode === 'local' && styles.activeModeBtnText]}>Lokal</Text>
-          </TouchableOpacity>
+        <View style={{ marginBottom: 15 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <TextInput 
+              style={[styles.input, { flex: 1, marginBottom: 0 }]} 
+              placeholder="IP Server:Port (mis: 192.168.1.250:8081)" 
+              placeholderTextColor="#94a3b8"
+              value={localServerIp} 
+              onChangeText={(val) => {
+                setLocalServerIp(val);
+                setServerConnected(false);
+                Storage.setItemAsync('local_server_ip', val);
+              }}
+            />
+            <TouchableOpacity 
+              style={styles.testBtn}
+              onPress={() => testLocalConnection(localServerIp)}
+            >
+              <RefreshCw color="#fff" size={16} />
+            </TouchableOpacity>
+          </View>
+          {localServerName ? <Text style={styles.serverConnected}>Terhubung ke: {localServerName}</Text> : null}
         </View>
 
-        {serverMode === 'local' && (
-          <View style={{ marginBottom: 15 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <TextInput 
-                style={[styles.input, { flex: 1, marginBottom: 0 }]} 
-                placeholder="IP Server:Port (mis: 192.168.1.18:8081)" 
-                placeholderTextColor="#94a3b8"
-                value={localServerIp} 
-                onChangeText={(val) => {
-                  setLocalServerIp(val);
-                  setServerConnected(false);
-                  SecureStore.setItemAsync('local_server_ip', val);
-                }}
-              />
-              <TouchableOpacity 
-                style={styles.testBtn}
-                onPress={() => testLocalConnection(localServerIp)}
-              >
-                <RefreshCw color="#fff" size={16} />
-              </TouchableOpacity>
-            </View>
-            {localServerName ? <Text style={styles.serverConnected}>Terhubung ke: {localServerName}</Text> : null}
-          </View>
-        )}
-
-        {serverConnected ? (
-          <>
-            <TextInput 
-              style={styles.input} placeholder="Email" placeholderTextColor="#94a3b8"
-              value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none"
-            />
-            <View style={styles.passwordContainer}>
-              <TextInput 
-                style={styles.passwordInput} placeholder="Password" placeholderTextColor="#94a3b8"
-                value={password} onChangeText={setPassword} secureTextEntry={!showPassword}
-              />
-              <TouchableOpacity onPress={() => setShowPassword(!showPassword)} style={styles.eyeIcon}>
-                {showPassword ? <EyeOff color="#94a3b8" size={20} /> : <Eye color="#94a3b8" size={20} />}
-              </TouchableOpacity>
-            </View>
-            <TouchableOpacity style={styles.btn} onPress={handleLogin} disabled={loading}>
-              {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnText}>MASUK</Text>}
-            </TouchableOpacity>
-          </>
-        ) : (
-          <Text style={{ color: '#ef4444', textAlign: 'center', marginTop: 10 }}>
-            Harap hubungkan dan tes koneksi ke Server Lokal terlebih dahulu.
-          </Text>
-        )}
+        <TextInput 
+          style={styles.input} placeholder="Email" placeholderTextColor="#94a3b8"
+          value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none"
+        />
+        <View style={styles.passwordContainer}>
+          <TextInput 
+            style={styles.passwordInput} placeholder="Password" placeholderTextColor="#94a3b8"
+            value={password} onChangeText={setPassword} secureTextEntry={!showPassword}
+          />
+          <TouchableOpacity onPress={() => setShowPassword(!showPassword)} style={styles.eyeIcon}>
+            {showPassword ? <EyeOff color="#94a3b8" size={20} /> : <Eye color="#94a3b8" size={20} />}
+          </TouchableOpacity>
+        </View>
+        <TouchableOpacity style={styles.btn} onPress={handleLogin} disabled={loading}>
+          {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnText}>MASUK</Text>}
+        </TouchableOpacity>
       </View>
     );
   }
 
+
+  
+
+
+  const getHeaderTitle = () => {
+    switch (activeTab) {
+      case 'dashboard': return 'Dashboard';
+      case 'kasir': return 'Kasir';
+      case 'transfer': return 'Kiriman Stok';
+      case 'settings': return 'Pengaturan';
+      default: return 'Aplikasi Kasir';
+    }
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.headerText}>{user?.name} | {user?.roles?.[0]}</Text>
-        <TouchableOpacity onPress={() => setIsLoggedIn(false)}><LogOut size={20} color="#fff" /></TouchableOpacity>
+        <View>
+          <Text style={styles.headerText}>{getHeaderTitle()}</Text>
+          <Text style={{color: '#94a3b8', fontSize: 12}}>{user?.name} | {user?.roles?.[0]}</Text>
+        </View>
+        <TouchableOpacity onPress={handleLogout}><LogOut size={20} color="#fff" /></TouchableOpacity>
       </View>
 
       <View style={styles.content}>
         {activeTab === 'dashboard' && (
-          <View style={styles.dashboard}>
+          <ScrollView style={styles.dashboard} contentContainerStyle={{ paddingBottom: 20 }}>
             <View style={styles.filterRow}>
               {['today', 'month', 'all'].map((f) => (
                 <TouchableOpacity key={f} onPress={() => setDateFilter(f)} style={[styles.filterBtn, dateFilter === f && styles.activeFilter]}>
@@ -781,14 +836,59 @@ export default function App() {
                 </TouchableOpacity>
               ))}
             </View>
+
+            <View style={styles.dashStatRow}>
+              <View style={[styles.dashStatBox, {backgroundColor: '#3b82f6'}]}>
+                <Text style={styles.dashStatValue}>{products.length}</Text>
+                <Text style={styles.dashStatLabel}>Produk</Text>
+              </View>
+              <View style={[styles.dashStatBox, {backgroundColor: '#22c55e'}]}>
+                <Text style={styles.dashStatValue}>{todayCount}</Text>
+                <Text style={styles.dashStatLabel}>Transaksi</Text>
+              </View>
+              <View style={[styles.dashStatBox, {backgroundColor: '#eab308'}]}>
+                <Text style={styles.dashStatValue}>{transferStats.pending}</Text>
+                <Text style={styles.dashStatLabel}>Pending</Text>
+              </View>
+            </View>
+
             <View style={styles.omsetCard}>
               <Text style={styles.omsetTitle}>Total Omset</Text>
-              <Text style={styles.omsetValue}>Rp {omset.toLocaleString()}</Text>
+              <Text style={styles.omsetValue}>Rp {Number(omset).toLocaleString()}</Text>
             </View>
-          </View>
+
+            {lowStockProducts.length > 0 && (
+              <View style={styles.dashSection}>
+                <Text style={styles.dashSectionTitle}>Stok Menipis</Text>
+                {lowStockProducts.slice(0, 5).map((p, i) => (
+                  <View key={i} style={styles.dashRow}>
+                    <Text style={styles.dashRowLabel} numberOfLines={1}>{p.name}</Text>
+                    <Text style={[styles.dashRowValue, {color: '#ef4444'}]}>Stok: {p.stock}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            {recentSales.length > 0 && (
+              <View style={styles.dashSection}>
+                <Text style={styles.dashSectionTitle}>Transaksi Terakhir</Text>
+                {recentSales.map((s, i) => (
+                  <View key={i} style={styles.dashRow}>
+                    <Text style={styles.dashRowLabel} numberOfLines={1}>{s.created_at}</Text>
+                    <Text style={styles.dashRowValue}>Rp {Number(s.total).toLocaleString()}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            <View style={styles.syncInfoRow}>
+              <RefreshCw color="#94a3b8" size={12} />
+              <Text style={styles.syncInfoText}>Sync: {syncTime || 'Belum pernah'}</Text>
+            </View>
+          </ScrollView>
         )}
 
-        {(activeTab === 'kasir' || activeTab === 'stok') && (
+        {activeTab === 'kasir' && (
           <View style={{ flex: 1 }}>
             <View style={styles.searchBar}>
               <Search size={20} color="#666" />
@@ -805,6 +905,22 @@ export default function App() {
 
         {activeTab === 'transfer' && (
           <View style={{ flex: 1 }}>
+            <View style={styles.statsRow}>
+              <View style={[styles.statBox, {backgroundColor: '#3b82f6'}]}>
+                <Text style={styles.statBoxTitle}>Total</Text>
+                <Text style={styles.statBoxValue}>{transferStats.total}</Text>
+              </View>
+              <View style={[styles.statBox, {backgroundColor: '#eab308'}]}>
+                <Text style={styles.statBoxTitle}>Pending</Text>
+                <Text style={styles.statBoxValue}>{transferStats.pending}</Text>
+              </View>
+              <View style={[styles.statBox, {backgroundColor: '#22c55e'}]}>
+                <Text style={styles.statBoxTitle}>Selesai</Text>
+                <Text style={styles.statBoxValue}>{transferStats.completed}</Text>
+              </View>
+            </View>
+
+            <Text style={styles.filterGroupLabel}>Status:</Text>
             <View style={styles.filterScroll}>
               <FlashList
                 horizontal
@@ -818,6 +934,8 @@ export default function App() {
                 showsHorizontalScrollIndicator={false}
               />
             </View>
+
+            <Text style={styles.filterGroupLabel}>Pengirim:</Text>
             <View style={styles.filterScroll}>
               <FlashList
                 horizontal
@@ -831,6 +949,24 @@ export default function App() {
                 showsHorizontalScrollIndicator={false}
               />
             </View>
+
+            <Text style={styles.filterGroupLabel}>Waktu:</Text>
+            <View style={styles.filterScroll}>
+              <FlashList
+                horizontal
+                data={['all', 'today', 'month']}
+                renderItem={({ item }) => (
+                  <TouchableOpacity onPress={() => setTransferDateFilter(item)} style={[styles.miniFilter, transferDateFilter === item && styles.activeFilter]}>
+                    <Text style={[styles.miniFilterText, transferDateFilter === item && styles.activeFilterText]}>
+                      {item === 'all' ? 'SEMUA' : item === 'today' ? 'HARI INI' : 'BULAN INI'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+                estimatedItemSize={80}
+                showsHorizontalScrollIndicator={false}
+              />
+            </View>
+
             <FlashList 
               data={filteredTransfers}
               keyExtractor={item => item.id}
@@ -841,17 +977,29 @@ export default function App() {
         )}
 
         {activeTab === 'settings' && (
-          <View style={styles.settings}>
+          <ScrollView style={styles.settings} contentContainerStyle={{ paddingBottom: 40 }}>
             <View style={styles.settingCard}>
               <View style={styles.settingRow}>
                 <User color="#3b82f6" size={20} />
                 <View style={{ marginLeft: 15 }}>
                   <Text style={styles.settingTitle}>{user?.name}</Text>
                   <Text style={styles.settingLabel}>{user?.email}</Text>
-                  <Text style={styles.settingLabel}>{user?.roles?.[0]}</Text>
+                  <Text style={styles.settingLabel}>
+                    {user?.roles?.[0]} • {selectedBranch?.nama_cabang || user?.branch?.nama_cabang || selectedBranch?.name || user?.branch?.name || 'Cabang Belum Dipilih'}
+                  </Text>
                 </View>
               </View>
             </View>
+
+            <TouchableOpacity style={styles.settingCard} onPress={() => setShowStockModal(true)}>
+              <View style={styles.settingRow}>
+                <Package color="#3b82f6" size={20} />
+                <View style={{ marginLeft: 15, flex: 1 }}>
+                  <Text style={styles.settingTitle}>Stok Produk</Text>
+                  <Text style={styles.settingLabel}>Lihat dan cari stok produk</Text>
+                </View>
+              </View>
+            </TouchableOpacity>
 
             <View style={styles.settingCard}>
               <View style={styles.settingRow}>
@@ -976,8 +1124,44 @@ export default function App() {
               <LogOut color="#ef4444" size={20} />
               <Text style={styles.logoutBtnText}>LOGOUT</Text>
             </TouchableOpacity>
-          </View>
+          </ScrollView>
         )}
+
+        {/* Modal Stok Produk */}
+        <Modal visible={showStockModal} animationType="slide" onRequestClose={() => setShowStockModal(false)}>
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Stok Produk</Text>
+              <TouchableOpacity onPress={() => setShowStockModal(false)}>
+                <Text style={styles.modalClose}>Tutup</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={styles.searchBar}>
+              <Search size={20} color="#666" />
+              <TextInput style={styles.searchInput} placeholder="Cari produk..." value={stockSearch} onChangeText={setStockSearch} />
+            </View>
+            <FlashList 
+              data={filteredStockProducts}
+              keyExtractor={item => item.id}
+              renderItem={({ item }) => (
+                <View style={styles.productCard} pointerEvents="none">
+                  <View style={styles.pInfo}>
+                    <Text style={styles.pName} numberOfLines={1}>{item.name}</Text>
+                    <Text style={styles.pPrice}>Rp {item.sell_price.toLocaleString()}</Text>
+                  </View>
+                  <View style={styles.pRight}>
+                    <Text style={[styles.pStock, {color: item.stock > 0 ? '#22c55e' : '#ef4444'}]}>Stok: {item.stock}</Text>
+                    <Text style={styles.pUnit}>{item.unit}</Text>
+                  </View>
+                </View>
+              )}
+              estimatedItemSize={70}
+              ListEmptyComponent={
+                <Text style={{ textAlign: 'center', marginTop: 50, color: '#94a3b8' }}>Tidak ada produk</Text>
+              }
+            />
+          </View>
+        </Modal>
       </View>
 
       {cart.length > 0 && activeTab === 'kasir' && (
@@ -991,8 +1175,7 @@ export default function App() {
         {[
           { id: 'dashboard', icon: LayoutDashboard, label: 'Dash' },
           { id: 'kasir', icon: ShoppingCart, label: 'Kasir' },
-          { id: 'stok', icon: Package, label: 'Stok' },
-          { id: 'transfer', icon: Package, label: 'Kirim' },
+          { id: 'transfer', icon: Package, label: 'Kiriman Stok' },
           { id: 'settings', icon: Settings, label: 'Pengaturan' }
         ].map((item) => (
           <TouchableOpacity 
@@ -1071,6 +1254,15 @@ const styles = StyleSheet.create({
   settingTitle: { fontWeight: 'bold', fontSize: 16, color: '#0f172a', marginBottom: 5 },
   settingLabel: { fontSize: 14, color: '#64748b', marginBottom: 2 },
   settingInput: { borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 5, padding: 8, fontSize: 14, color: '#0f172a', marginTop: 5, backgroundColor: '#f8fafc' },
+  statsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15 },
+  statBox: { flex: 1, marginHorizontal: 3, padding: 12, borderRadius: 8, alignItems: 'center' },
+  statBoxTitle: { color: '#fff', fontSize: 10, fontWeight: 'bold', marginBottom: 3 },
+  statBoxValue: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  filterGroupLabel: { fontSize: 11, color: '#64748b', fontWeight: 'bold', marginBottom: 4, marginTop: 4 },
+  modalContainer: { flex: 1, backgroundColor: '#f8fafc', paddingTop: 50, paddingHorizontal: 15 },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15, marginTop: 10 },
+  modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#0f172a' },
+  modalClose: { color: '#3b82f6', fontWeight: 'bold', fontSize: 14 },
   printerOptions: { flexDirection: 'row', marginTop: 10, marginBottom: 10 },
   printerBtn: { paddingVertical: 6, paddingHorizontal: 15, borderWidth: 1, borderColor: '#cbd5e1', borderRadius: 5, marginRight: 10 },
   activePrinterBtn: { backgroundColor: '#3b82f6', borderColor: '#3b82f6' },
@@ -1085,5 +1277,16 @@ const styles = StyleSheet.create({
   printerList: { marginTop: 15, borderTopWidth: 1, borderTopColor: '#e2e8f0' },
   printerListItem: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#f1f5f9' },
   printerListText: { fontSize: 14, fontWeight: 'bold', color: '#1e293b' },
-  printerListSub: { fontSize: 12, color: '#64748b' }
+  printerListSub: { fontSize: 12, color: '#64748b' },
+  dashStatRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15 },
+  dashStatBox: { flex: 1, marginHorizontal: 3, padding: 12, borderRadius: 10, alignItems: 'center', elevation: 2 },
+  dashStatValue: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  dashStatLabel: { color: '#fff', fontSize: 10, fontWeight: 'bold', marginTop: 2 },
+  dashSection: { backgroundColor: '#fff', borderRadius: 10, padding: 15, marginTop: 15, elevation: 1 },
+  dashSectionTitle: { fontSize: 14, fontWeight: 'bold', color: '#0f172a', marginBottom: 10 },
+  dashRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#f1f5f9' },
+  dashRowLabel: { fontSize: 12, color: '#475569', flex: 1, marginRight: 10 },
+  dashRowValue: { fontSize: 12, fontWeight: 'bold', color: '#0f172a' },
+  syncInfoRow: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginTop: 20 },
+  syncInfoText: { fontSize: 10, color: '#94a3b8', marginLeft: 5 },
 });

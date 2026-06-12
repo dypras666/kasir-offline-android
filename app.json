@@ -46,7 +46,15 @@
         {
           "android": {
             "hermesEnabled": true,
-            "newArchEnabled": true
+            "newArchEnabled": true,
+            "enableProguardInReleaseBuilds": true,
+            "enableSplitBundleInReleaseBuilds": true,
+            "packagingOptions": {
+              "pickFirst": [
+                "**/libc++_shared.so"
+              ]
+            },
+            "abiFilters": ["arm64-v8a"]
           }
         }
       ]
