@@ -9,7 +9,11 @@ import * as SecureStore from 'expo-secure-store';
 import { FlashList } from "@shopify/flash-list";
 import { Image } from 'expo-image';
 import axios from 'axios';
-import { ShoppingCart, Package, RefreshCw, LogOut, Search, Eye, EyeOff, LayoutDashboard, Settings, User, Printer, Bluetooth, Trash2, CheckCircle } from 'lucide-react-native';
+import { 
+  ShoppingCart, Package, RefreshCw, LogOut, Search, Eye, EyeOff, 
+  LayoutDashboard, Settings, User, Printer, Bluetooth, Trash2, CheckCircle,
+  Plus, ArrowRight, ArrowLeft, ChevronRight, ChevronLeft, ArrowDownToLine, ArrowUpFromLine, ListFilter
+} from 'lucide-react-native';
 
 // Mock printer for web
 const PrintersDiscovery = Platform.OS === 'web' ? { 
@@ -123,6 +127,21 @@ export default function App() {
   const [transferSource, setTransferSource] = useState('all'); // all, or source name
   const [transferDateFilter, setTransferDateFilter] = useState('all'); // all, today, month
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [transferSubTab, setTransferSubTab] = useState('terima'); // terima or kirim
+  const [showKirimModal, setShowKirimModal] = useState(false);
+  const [transferCart, setTransferCart] = useState([]);
+  const [targetBranch, setTargetBranch] = useState(null);
+  const [transferSearch, setTransferSearch] = useState('');
+  const [transferPage, setTransferPage] = useState(1);
+  const [transferItemsPerPage, setTransferItemsPerPage] = useState(10);
+  const [transferColumns, setTransferColumns] = useState({
+    no: true,
+    route: true,
+    date: true,
+    status: true,
+    actions: true
+  });
+  const [modalProductSearch, setModalProductSearch] = useState('');
   const [dateFilter, setDateFilter] = useState('today');
   const [omset, setOmset] = useState(0);
   const [isSplashVisible, setIsSplashVisible] = useState(true);
@@ -324,8 +343,7 @@ export default function App() {
         }
         return;
       }
-      // Selalu hit online database cloud (API_URL)
-      const resp = await axios.get(`${API_URL}/api/v1/stock-transfers?to_branch_id=${branchId}&branch_id=${branchId}`, {
+      const resp = await axios.get(`${getBaseUrl()}/api/v1/stock-transfers?to_branch_id=${branchId}&branch_id=${branchId}`, {
         headers: { Authorization: `Bearer ${token}` },
         timeout: 8000
       });
@@ -360,7 +378,7 @@ export default function App() {
         setTransfers(rows);
       }
     }
-  }, [selectedBranch, user]);
+  }, [getBaseUrl, selectedBranch, user]);
 
   const loadOmset = useCallback(async () => {
     if (Platform.OS === 'web') {
@@ -687,6 +705,65 @@ export default function App() {
     Alert.alert('Sukses', 'Transaksi Berhasil!');
   }, [cart, loadOmset, selectedPrinter, storeName, storeContact, storeFooter]);
 
+  const kirimBarang = async () => {
+    if (!targetBranch) {
+      Alert.alert('Error', 'Pilih cabang tujuan.');
+      return;
+    }
+    if (transferCart.length === 0) {
+      Alert.alert('Error', 'Pilih minimal satu produk.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const token = await Storage.getItemAsync('user_token');
+      const branchId = selectedBranch?.id || user?.branch_id || 1;
+      await axios.post(`${getBaseUrl()}/api/v1/stock-transfers`, {
+        from_branch_id: branchId,
+        to_branch_id: targetBranch.id,
+        transfer_date: new Date().toISOString(),
+        items: transferCart.map(i => ({
+          product_id: i.id,
+          qty: i.qty,
+          unit_name: i.unit
+        }))
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setTransferCart([]);
+      setShowKirimModal(false);
+      loadTransfers();
+      Alert.alert('Sukses', 'Transfer stok berhasil dikirim.');
+    } catch (e) {
+      console.error(e);
+      Alert.alert('Error', 'Gagal mengirim transfer stok.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addToTransferCart = (p) => {
+    setTransferCart(prev => {
+      const existing = prev.find(item => item.id === p.id);
+      if (existing) return prev.map(item => item.id === p.id ? { ...item, qty: item.qty + 1 } : item);
+      return [...prev, { ...p, qty: 1 }];
+    });
+  };
+
+  const removeFromTransferCart = (id) => {
+    setTransferCart(prev => prev.filter(i => i.id !== id));
+  };
+
+  const updateTransferQty = (id, delta) => {
+    setTransferCart(prev => prev.map(i => {
+      if (i.id === id) {
+        const newQty = Math.max(1, i.qty + delta);
+        return { ...i, qty: newQty };
+      }
+      return i;
+    }));
+  };
+
   const terimaBarang = async (id) => {
     setLoading(true);
     try {
@@ -709,6 +786,10 @@ export default function App() {
   
   const filteredTransfers = useMemo(() => {
     return transfers.filter(t => {
+      const matchSearch = (t.from_name || '').toLowerCase().includes(transferSearch.toLowerCase()) || 
+                          (t.to_name || '').toLowerCase().includes(transferSearch.toLowerCase()) || 
+                          (t.status || '').toLowerCase().includes(transferSearch.toLowerCase());
+      
       const matchStatus = transferFilter === 'all' || t.status === transferFilter;
       const matchSource = transferSource === 'all' || t.from_name === transferSource;
       
@@ -721,9 +802,29 @@ export default function App() {
         matchDate = t.transfer_date.startsWith(thisMonth);
       }
 
-      return matchStatus && matchSource && matchDate;
+      // Check current branch details to filter by tab
+      const currentBranchId = selectedBranch?.id || user?.branch_id || 1;
+      const currentBranchName = selectedBranch?.name || selectedBranch?.nama_cabang || user?.branch?.name || user?.branch?.nama_cabang || '';
+      
+      let matchDirection = true;
+      if (transferSubTab === 'kirim') {
+        matchDirection = (t.from_name || '').toLowerCase() === currentBranchName.toLowerCase();
+      } else {
+        matchDirection = (t.to_name || '').toLowerCase() === currentBranchName.toLowerCase();
+      }
+
+      return matchSearch && matchStatus && matchSource && matchDate && matchDirection;
     });
-  }, [transfers, transferFilter, transferSource, transferDateFilter]);
+  }, [transfers, transferSearch, transferFilter, transferSource, transferDateFilter, transferSubTab, selectedBranch, user]);
+
+  const paginatedTransfers = useMemo(() => {
+    const start = (transferPage - 1) * transferItemsPerPage;
+    return filteredTransfers.slice(start, start + transferItemsPerPage);
+  }, [filteredTransfers, transferPage, transferItemsPerPage]);
+
+  const totalTransferPages = useMemo(() => {
+    return Math.ceil(filteredTransfers.length / transferItemsPerPage) || 1;
+  }, [filteredTransfers, transferItemsPerPage]);
 
   const sources = useMemo(() => {
     const s = new Set(transfers.map(t => t.from_name));
@@ -904,75 +1005,202 @@ export default function App() {
         )}
 
         {activeTab === 'transfer' && (
-          <View style={{ flex: 1 }}>
+          <View style={{ flex: 1, padding: 8 }}>
+            {/* Sub-tab: Terima (Incoming) vs Kirim (Outgoing) */}
+            <View style={styles.subTabRow}>
+              <TouchableOpacity 
+                style={[styles.subTabBtn, transferSubTab === 'terima' && styles.subTabBtnActive]}
+                onPress={() => { setTransferSubTab('terima'); setTransferPage(1); }}
+              >
+                <ArrowDownToLine size={18} color={transferSubTab === 'terima' ? '#fff' : '#475569'} />
+                <Text style={[styles.subTabBtnText, transferSubTab === 'terima' && styles.subTabBtnTextActive]}>
+                  Terima Barang
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[styles.subTabBtn, transferSubTab === 'kirim' && styles.subTabBtnActive]}
+                onPress={() => { setTransferSubTab('kirim'); setTransferPage(1); }}
+              >
+                <ArrowUpFromLine size={18} color={transferSubTab === 'kirim' ? '#fff' : '#475569'} />
+                <Text style={[styles.subTabBtnText, transferSubTab === 'kirim' && styles.subTabBtnTextActive]}>
+                  Kirim Barang
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Quick Stats */}
             <View style={styles.statsRow}>
               <View style={[styles.statBox, {backgroundColor: '#3b82f6'}]}>
                 <Text style={styles.statBoxTitle}>Total</Text>
-                <Text style={styles.statBoxValue}>{transferStats.total}</Text>
+                <Text style={styles.statBoxValue}>{filteredTransfers.length}</Text>
               </View>
               <View style={[styles.statBox, {backgroundColor: '#eab308'}]}>
                 <Text style={styles.statBoxTitle}>Pending</Text>
-                <Text style={styles.statBoxValue}>{transferStats.pending}</Text>
+                <Text style={styles.statBoxValue}>
+                  {filteredTransfers.filter(t => t.status === 'pending').length}
+                </Text>
               </View>
               <View style={[styles.statBox, {backgroundColor: '#22c55e'}]}>
                 <Text style={styles.statBoxTitle}>Selesai</Text>
-                <Text style={styles.statBoxValue}>{transferStats.completed}</Text>
+                <Text style={styles.statBoxValue}>
+                  {filteredTransfers.filter(t => t.status === 'completed' || t.status === 'selesai').length}
+                </Text>
               </View>
             </View>
 
-            <Text style={styles.filterGroupLabel}>Status:</Text>
-            <View style={styles.filterScroll}>
-              <FlashList
-                horizontal
-                data={['all', 'pending', 'completed']}
-                renderItem={({ item }) => (
-                  <TouchableOpacity onPress={() => setTransferFilter(item)} style={[styles.miniFilter, transferFilter === item && styles.activeFilter]}>
-                    <Text style={[styles.miniFilterText, transferFilter === item && styles.activeFilterText]}>{item.toUpperCase()}</Text>
+            {/* Search & Control Panel */}
+            <View style={styles.controlPanel}>
+              <View style={styles.searchBar}>
+                <Search size={18} color="#64748b" />
+                <TextInput 
+                  style={styles.searchInput} 
+                  placeholder="Cari transfer..." 
+                  value={transferSearch} 
+                  onChangeText={(txt) => { setTransferSearch(txt); setTransferPage(1); }}
+                />
+                {transferSubTab === 'kirim' && (
+                  <TouchableOpacity 
+                    style={styles.addTransferBtn}
+                    onPress={() => setShowKirimModal(true)}
+                  >
+                    <Plus size={16} color="#fff" />
+                    <Text style={styles.addTransferBtnText}>KIRIM</Text>
                   </TouchableOpacity>
                 )}
-                estimatedItemSize={50}
-                showsHorizontalScrollIndicator={false}
-              />
-            </View>
+              </View>
 
-            <Text style={styles.filterGroupLabel}>Pengirim:</Text>
-            <View style={styles.filterScroll}>
-              <FlashList
-                horizontal
-                data={sources}
-                renderItem={({ item }) => (
-                  <TouchableOpacity onPress={() => setTransferSource(item)} style={[styles.miniFilter, transferSource === item && styles.activeFilter]}>
-                    <Text style={[styles.miniFilterText, transferSource === item && styles.activeFilterText]}>{item}</Text>
-                  </TouchableOpacity>
-                )}
-                estimatedItemSize={100}
-                showsHorizontalScrollIndicator={false}
-              />
-            </View>
-
-            <Text style={styles.filterGroupLabel}>Waktu:</Text>
-            <View style={styles.filterScroll}>
-              <FlashList
-                horizontal
-                data={['all', 'today', 'month']}
-                renderItem={({ item }) => (
-                  <TouchableOpacity onPress={() => setTransferDateFilter(item)} style={[styles.miniFilter, transferDateFilter === item && styles.activeFilter]}>
-                    <Text style={[styles.miniFilterText, transferDateFilter === item && styles.activeFilterText]}>
-                      {item === 'all' ? 'SEMUA' : item === 'today' ? 'HARI INI' : 'BULAN INI'}
+              {/* Column Visibility Toggles */}
+              <View style={styles.colToggleContainer}>
+                <ListFilter size={14} color="#64748b" style={{ marginRight: 4 }} />
+                <Text style={styles.colToggleLabel}>Kolom:</Text>
+                {Object.keys(transferColumns).map(col => (
+                  <TouchableOpacity 
+                    key={col} 
+                    style={[styles.colToggleBtn, transferColumns[col] && styles.colToggleBtnActive]}
+                    onPress={() => setTransferColumns(prev => ({ ...prev, [col]: !prev[col] }))}
+                  >
+                    <Text style={[styles.colToggleText, transferColumns[col] && styles.colToggleTextActive]}>
+                      {col === 'no' ? 'No' : col === 'route' ? 'Rute' : col === 'date' ? 'Tgl' : col === 'status' ? 'Sts' : 'Aksi'}
                     </Text>
                   </TouchableOpacity>
-                )}
-                estimatedItemSize={80}
-                showsHorizontalScrollIndicator={false}
-              />
+                ))}
+              </View>
             </View>
 
+            {/* Table Header */}
+            <View style={styles.tableHeader}>
+              {transferColumns.no && <Text style={[styles.th, { width: 32 }]}>#</Text>}
+              {transferColumns.route && <Text style={[styles.th, { flex: 2 }]}>Rute</Text>}
+              {transferColumns.date && <Text style={[styles.th, { flex: 1.5 }]}>Tanggal</Text>}
+              {transferColumns.status && <Text style={[styles.th, { flex: 1 }]}>Status</Text>}
+              {transferColumns.actions && <Text style={[styles.th, { flex: 1, textAlign: 'center' }]}>Aksi</Text>}
+            </View>
+
+            {/* Table Body */}
             <FlashList 
-              data={filteredTransfers}
+              data={paginatedTransfers}
               keyExtractor={item => item.id}
-              renderItem={({ item }) => <TransferItem item={item} onAccept={terimaBarang} userRole={user?.roles?.[0]} />}
-              estimatedItemSize={70}
+              estimatedItemSize={55}
+              renderItem={({ item, index }) => {
+                const globalIdx = (transferPage - 1) * transferItemsPerPage + index + 1;
+                return (
+                  <View style={styles.tableRow}>
+                    {transferColumns.no && (
+                      <Text style={[styles.td, { width: 32, color: '#94a3b8', fontSize: 11, textAlign: 'center' }]}>
+                        {globalIdx}
+                      </Text>
+                    )}
+                    {transferColumns.route && (
+                      <View style={[styles.td, { flex: 2, flexDirection: 'column', alignItems: 'flex-start' }]}>
+                        <Text style={{ fontSize: 12, fontWeight: '600', color: '#0f172a' }} numberOfLines={1}>
+                          {item.from_name || '?'}
+                        </Text>
+                        <Text style={{ fontSize: 10, color: '#94a3b8' }}>➔</Text>
+                        <Text style={{ fontSize: 11, color: '#475569' }} numberOfLines={1}>
+                          {item.to_name || '?'}
+                        </Text>
+                      </View>
+                    )}
+                    {transferColumns.date && (
+                      <Text style={[styles.td, { flex: 1.5, fontSize: 11, color: '#64748b' }]} numberOfLines={1}>
+                        {item.transfer_date ? item.transfer_date.split('T')[0] : '-'}
+                      </Text>
+                    )}
+                    {transferColumns.status && (
+                      <View style={[styles.td, { flex: 1 }]}>
+                        <View style={[styles.statusBadge, { 
+                          backgroundColor: (item.status === 'completed' || item.status === 'selesai') ? '#dcfce7' : '#fef9c7' 
+                        }]}>
+                          <Text style={[styles.statusText, {
+                            color: (item.status === 'completed' || item.status === 'selesai') ? '#15803d' : '#a16207'
+                          }]}>
+                            {(item.status || 'pending').toUpperCase()}
+                          </Text>
+                        </View>
+                      </View>
+                    )}
+                    {transferColumns.actions && (
+                      <View style={[styles.td, { flex: 1, alignItems: 'center', justifyContent: 'center' }]}>
+                        {item.status === 'pending' && transferSubTab === 'terima' ? (
+                          <TouchableOpacity 
+                            style={styles.acceptBtn}
+                            onPress={() => {
+                              if (user?.roles?.[0] === 'Kasir Cabang') {
+                                Alert.alert('Akses Ditolak', 'Hanya Admin Cabang yang dapat menerima barang.');
+                                return;
+                              }
+                              Alert.alert(
+                                'Konfirmasi', 
+                                'Terima barang ini?', 
+                                [{ text: 'Batal' }, { text: 'Ya', onPress: () => terimaBarang(item.id) }]
+                              );
+                            }}
+                          >
+                            <CheckCircle size={16} color="#15803d" />
+                          </TouchableOpacity>
+                        ) : (
+                          <Text style={{ fontSize: 11, color: '#cbd5e1' }}>-</Text>
+                        )}
+                      </View>
+                    )}
+                  </View>
+                );
+              }}
+              ListEmptyComponent={
+                <View style={{ padding: 30, alignItems: 'center' }}>
+                  <Package size={40} color="#cbd5e1" />
+                  <Text style={{ marginTop: 10, color: '#94a3b8', textAlign: 'center' }}>
+                    Tidak ada data transfer stok
+                  </Text>
+                </View>
+              }
             />
+
+            {/* Pagination */}
+            {filteredTransfers.length > 0 && (
+              <View style={styles.paginationRow}>
+                <TouchableOpacity 
+                  disabled={transferPage === 1}
+                  onPress={() => setTransferPage(prev => Math.max(1, prev - 1))}
+                  style={[styles.pageBtn, transferPage === 1 && styles.pageBtnDisabled]}
+                >
+                  <ChevronLeft size={20} color={transferPage === 1 ? '#cbd5e1' : '#0f172a'} />
+                </TouchableOpacity>
+
+                <Text style={styles.pageInfo}>
+                  Hal {transferPage} dari {totalTransferPages}
+                </Text>
+
+                <TouchableOpacity 
+                  disabled={transferPage === totalTransferPages}
+                  onPress={() => setTransferPage(prev => Math.min(totalTransferPages, prev + 1))}
+                  style={[styles.pageBtn, transferPage === totalTransferPages && styles.pageBtnDisabled]}
+                >
+                  <ChevronRight size={20} color={transferPage === totalTransferPages ? '#cbd5e1' : '#0f172a'} />
+                </TouchableOpacity>
+              </View>
+            )}
           </View>
         )}
 
@@ -1162,6 +1390,142 @@ export default function App() {
             />
           </View>
         </Modal>
+
+        {/* Modal Kirim Transfer Stok */}
+        <Modal 
+          visible={showKirimModal} 
+          animationType="slide" 
+          onRequestClose={() => setShowKirimModal(false)}
+        >
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Kirim Transfer Stok</Text>
+              <TouchableOpacity onPress={() => setShowKirimModal(false)}>
+                <Text style={styles.modalClose}>Batal</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Step 1: Pilih Cabang Tujuan */}
+            <Text style={styles.formLabel}>Cabang Tujuan:</Text>
+            <View style={styles.branchSelectContainer}>
+              <FlashList 
+                horizontal
+                data={branches.filter(b => b.id !== (selectedBranch?.id || user?.branch_id))}
+                estimatedItemSize={100}
+                showsHorizontalScrollIndicator={false}
+                renderItem={({ item }) => (
+                  <TouchableOpacity 
+                    style={[
+                      styles.branchSelectBtn, 
+                      targetBranch?.id === item.id && styles.branchSelectBtnActive
+                    ]}
+                    onPress={() => setTargetBranch(item)}
+                  >
+                    <Text style={[
+                      styles.branchSelectText,
+                      targetBranch?.id === item.id && styles.branchSelectTextActive
+                    ]}>
+                      {item.name || item.nama_cabang || `Cabang ${item.id}`}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+                ListEmptyComponent={
+                  <Text style={{ color: '#64748b', fontSize: 12, paddingLeft: 10 }}>Tidak ada cabang tujuan lain</Text>
+                }
+              />
+            </View>
+
+            {/* Step 2: Cari & Tambah Produk */}
+            <Text style={styles.formLabel}>Pilih Produk:</Text>
+            <View style={styles.searchBar}>
+              <Search size={18} color="#64748b" />
+              <TextInput 
+                style={styles.searchInput} 
+                placeholder="Cari produk untuk ditransfer..." 
+                value={modalProductSearch} 
+                onChangeText={setModalProductSearch} 
+              />
+            </View>
+
+            <View style={{ height: 160, marginBottom: 10 }}>
+              <FlashList 
+                data={products.filter(p => p.name.toLowerCase().includes(modalProductSearch.toLowerCase()))}
+                keyExtractor={item => item.id}
+                estimatedItemSize={50}
+                renderItem={({ item }) => (
+                  <TouchableOpacity 
+                    style={styles.productSelectionRow}
+                    onPress={() => addToTransferCart(item)}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.productSelectName}>{item.name}</Text>
+                      <Text style={styles.productSelectStock}>Stok: {item.stock} {item.unit}</Text>
+                    </View>
+                    <View style={styles.addBtnCircle}>
+                      <Plus size={16} color="#3b82f6" />
+                    </View>
+                  </TouchableOpacity>
+                )}
+              />
+            </View>
+
+            {/* Step 3: Keranjang Item Transfer */}
+            <Text style={styles.formLabel}>Daftar Item Transfer ({transferCart.length}):</Text>
+            <View style={{ flex: 1, backgroundColor: '#f1f5f9', borderRadius: 8, padding: 8 }}>
+              <FlashList 
+                data={transferCart}
+                keyExtractor={item => item.id}
+                estimatedItemSize={60}
+                renderItem={({ item }) => (
+                  <View style={styles.cartItemRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.cartItemName} numberOfLines={1}>{item.name}</Text>
+                      <Text style={styles.cartItemUnit}>{item.unit}</Text>
+                    </View>
+                    <View style={styles.qtyContainer}>
+                      <TouchableOpacity 
+                        style={styles.qtyBtn}
+                        onPress={() => updateTransferQty(item.id, -1)}
+                      >
+                        <Text style={styles.qtyBtnText}>-</Text>
+                      </TouchableOpacity>
+                      <Text style={styles.qtyVal}>{item.qty}</Text>
+                      <TouchableOpacity 
+                        style={styles.qtyBtn}
+                        onPress={() => updateTransferQty(item.id, 1)}
+                      >
+                        <Text style={styles.qtyBtnText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <TouchableOpacity 
+                      style={styles.removeCartItemBtn}
+                      onPress={() => removeFromTransferCart(item.id)}
+                    >
+                      <Trash2 size={18} color="#ef4444" />
+                    </TouchableOpacity>
+                  </View>
+                )}
+                ListEmptyComponent={
+                  <View style={{ alignItems: 'center', marginTop: 30 }}>
+                    <Text style={{ color: '#94a3b8', fontSize: 13 }}>Belum ada produk dipilih</Text>
+                  </View>
+                }
+              />
+            </View>
+
+            {/* Submit Button */}
+            <TouchableOpacity 
+              style={[
+                styles.submitTransferBtn, 
+                (!targetBranch || transferCart.length === 0) && styles.submitTransferBtnDisabled
+              ]}
+              disabled={!targetBranch || transferCart.length === 0}
+              onPress={kirimBarang}
+            >
+              <Text style={styles.submitTransferBtnText}>KIRIM TRANSFER STOK</Text>
+            </TouchableOpacity>
+          </View>
+        </Modal>
       </View>
 
       {cart.length > 0 && activeTab === 'kasir' && (
@@ -1289,4 +1653,52 @@ const styles = StyleSheet.create({
   dashRowValue: { fontSize: 12, fontWeight: 'bold', color: '#0f172a' },
   syncInfoRow: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginTop: 20 },
   syncInfoText: { fontSize: 10, color: '#94a3b8', marginLeft: 5 },
+
+  // Transfer Stock UI Styles
+  subTabRow: { flexDirection: 'row', backgroundColor: '#e2e8f0', borderRadius: 10, padding: 3, marginBottom: 12 },
+  subTabBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 8, borderRadius: 8, gap: 6 },
+  subTabBtnActive: { backgroundColor: '#3b82f6' },
+  subTabBtnText: { fontSize: 12, fontWeight: 'bold', color: '#475569' },
+  subTabBtnTextActive: { color: '#fff' },
+  controlPanel: { marginBottom: 10 },
+  colToggleContainer: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 4, marginTop: 6 },
+  colToggleLabel: { fontSize: 11, color: '#64748b', fontWeight: 'bold', marginRight: 4 },
+  colToggleBtn: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 12, backgroundColor: '#e2e8f0' },
+  colToggleBtnActive: { backgroundColor: '#3b82f6' },
+  colToggleText: { fontSize: 10, fontWeight: 'bold', color: '#475569' },
+  colToggleTextActive: { color: '#fff' },
+  addTransferBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#3b82f6', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6, marginLeft: 8, gap: 4 },
+  addTransferBtnText: { color: '#fff', fontSize: 11, fontWeight: 'bold' },
+  tableHeader: { flexDirection: 'row', backgroundColor: '#f1f5f9', paddingVertical: 10, paddingHorizontal: 6, borderRadius: 8, marginBottom: 4 },
+  th: { fontSize: 11, fontWeight: 'bold', color: '#64748b' },
+  tableRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', paddingVertical: 10, paddingHorizontal: 6, borderBottomWidth: 1, borderBottomColor: '#f1f5f9', borderRadius: 4 },
+  td: { justifyContent: 'center' },
+  statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 12, alignSelf: 'flex-start' },
+  statusText: { fontSize: 10, fontWeight: 'bold' },
+  acceptBtn: { backgroundColor: '#f0fdf4', padding: 8, borderRadius: 20 },
+  paginationRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 12, gap: 16 },
+  pageBtn: { padding: 8, borderRadius: 8, backgroundColor: '#fff', elevation: 1 },
+  pageBtnDisabled: { opacity: 0.4 },
+  pageInfo: { fontSize: 13, fontWeight: '600', color: '#475569' },
+  formLabel: { fontSize: 13, fontWeight: 'bold', color: '#0f172a', marginTop: 12, marginBottom: 6 },
+  branchSelectContainer: { height: 48, marginBottom: 8 },
+  branchSelectBtn: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#e2e8f0', borderRadius: 10, marginRight: 8, justifyContent: 'center' },
+  branchSelectBtnActive: { backgroundColor: '#3b82f6' },
+  branchSelectText: { fontSize: 13, fontWeight: 'bold', color: '#475569' },
+  branchSelectTextActive: { color: '#fff' },
+  productSelectionRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', padding: 10, borderRadius: 8, marginBottom: 4, elevation: 1 },
+  productSelectName: { fontSize: 13, fontWeight: '600', color: '#0f172a' },
+  productSelectStock: { fontSize: 11, color: '#64748b', marginTop: 2 },
+  addBtnCircle: { width: 32, height: 32, borderRadius: 16, backgroundColor: '#eff6ff', alignItems: 'center', justifyContent: 'center' },
+  cartItemRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', padding: 10, borderRadius: 8, marginBottom: 4, elevation: 1 },
+  cartItemName: { fontSize: 13, fontWeight: '600', color: '#0f172a' },
+  cartItemUnit: { fontSize: 10, color: '#94a3b8', marginTop: 1 },
+  qtyContainer: { flexDirection: 'row', alignItems: 'center', marginRight: 12, gap: 8 },
+  qtyBtn: { width: 28, height: 28, borderRadius: 14, backgroundColor: '#e2e8f0', alignItems: 'center', justifyContent: 'center' },
+  qtyBtnText: { fontSize: 16, fontWeight: 'bold', color: '#475569' },
+  qtyVal: { fontSize: 16, fontWeight: 'bold', color: '#0f172a', minWidth: 20, textAlign: 'center' },
+  removeCartItemBtn: { padding: 6 },
+  submitTransferBtn: { backgroundColor: '#3b82f6', padding: 16, borderRadius: 10, alignItems: 'center', marginTop: 16, marginBottom: 40 },
+  submitTransferBtnDisabled: { backgroundColor: '#94a3b8' },
+  submitTransferBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
 });
