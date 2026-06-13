@@ -1,28 +1,10 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { 
   StyleSheet, Text, View, TextInput, TouchableOpacity, 
-  Alert as RNAlert, ActivityIndicator, Dimensions, Animated, Platform,
+  Alert, ActivityIndicator, Dimensions, Animated, Platform,
   ScrollView, Modal
 } from 'react-native';
 import { Toaster, toast } from 'sonner-native';
-
-const Alert = {
-  alert: (title, message, buttons) => {
-    if (buttons && buttons.length > 0) {
-      const okButton = buttons.find(b => b.text === 'Ya' || b.text === 'Logout' || b.text === 'OK' || b.text === 'Terima' || b.text === 'Kirim');
-      if (okButton && okButton.onPress) {
-        okButton.onPress();
-        return;
-      }
-    }
-    const isError = /error|gagal|akses ditolak|peringatan|denied/i.test(String(title) + ' ' + String(message));
-    if (isError) {
-      toast.error(message || title);
-    } else {
-      toast.success(message || title);
-    }
-  }
-};
 import * as SQLite from 'expo-sqlite';
 import * as SecureStore from 'expo-secure-store';
 import { FlashList } from "@shopify/flash-list";
@@ -76,7 +58,7 @@ const ProductItem = React.memo(({ item, onPress, isKasir }) => (
   >
     <View style={styles.pInfo}>
       <Text style={styles.pName} numberOfLines={1}>{item.name}</Text>
-      <Text style={styles.pPrice}>Rp {item.sell_price.toLocaleString()}</Text>
+      <Text style={styles.pPrice}>{formatRp(item.sell_price)}</Text>
     </View>
     <View style={styles.pRight}>
       <Text style={styles.pStock}>Stok: {item.stock}</Text>
@@ -91,7 +73,7 @@ const TransferItem = React.memo(({ item, onAccept, userRole }) => (
     onPress={() => {
       if (item.status === 'pending') {
         if (userRole === 'Kasir Cabang') {
-          Alert.alert('Akses Ditolak', 'Hanya Admin Cabang yang dapat menerima barang.');
+          toast.error('Hanya Admin Cabang yang dapat menerima barang.');
           return;
         }
         Alert.alert(
@@ -114,6 +96,7 @@ const TransferItem = React.memo(({ item, onAccept, userRole }) => (
   </TouchableOpacity>
 ));
 
+import { formatNumber, formatRp, formatDate } from './src/utils/format';
 import LoginScreen from './src/screens/LoginScreen';
 import { getBaseUrl, removeAuthData } from './src/services/api';
 import { useAuthStore } from './src/stores/authStore';
@@ -266,7 +249,13 @@ export default function App() {
     if (savedToken && savedUser) {
       try {
         const userData = JSON.parse(savedUser);
-        if (userData.branch) setSelectedBranch(userData.branch);
+        // Kasir locked to their branch_id; Admin can switch
+        if (userData.roles?.[0] === 'Kasir' || userData.roles?.[0] === 'Kasir Cabang') {
+          if (userData.branch) setSelectedBranch(userData.branch);
+          else if (userData.branch_id) setSelectedBranch({ id: userData.branch_id });
+        } else if (userData.branch) {
+          setSelectedBranch(userData.branch);
+        }
       } catch (e) {
         console.error('Failed to parse user data', e);
       }
@@ -275,7 +264,7 @@ export default function App() {
 
   const testLocalConnection = async (ip) => {
     if (!ip) {
-      Alert.alert('Error', 'Masukkan IP Server Lokal.');
+      toast.error('Masukkan IP Server Lokal.');
       return;
     }
     setLoading(true);
@@ -291,18 +280,24 @@ export default function App() {
         const branchResp = await axios.get(`http://${cleanIp}/api/v1/branches`);
         setBranches(branchResp.data || []);
         if (branchResp.data && branchResp.data.length > 0) {
-          setSelectedBranch(branchResp.data[0]);
+          // If logged-in user is cashier, lock to user branch_id. Otherwise default to first branch.
+          if (user && (user.roles?.[0] === 'Kasir' || user.roles?.[0] === 'Kasir Cabang')) {
+            if (user.branch) setSelectedBranch(user.branch);
+            else if (user.branch_id) setSelectedBranch({ id: user.branch_id });
+          } else {
+            setSelectedBranch(branchResp.data[0]);
+          }
         }
         
-        Alert.alert('Sukses', `Terhubung ke: ${resp.data.server}`);
+        toast.success(`Terhubung ke: ${resp.data.server}`);
       } else {
         setServerConnected(false);
-        Alert.alert('Gagal', 'Format data dari server salah.');
+        toast.error('Format data dari server salah.');
       }
     } catch (e) {
       console.error(e);
       setServerConnected(false);
-      Alert.alert('Koneksi Gagal', 'Tidak dapat terhubung ke server lokal. Pastikan IP benar dan satu WiFi.');
+      toast.error('Tidak dapat terhubung ke server lokal. Pastikan IP benar dan satu WiFi.');
     } finally {
       setLoading(false);
     }
@@ -459,7 +454,7 @@ export default function App() {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
-        Alert.alert('Permission Denied', 'Izin lokasi dibutuhkan.');
+        toast.error('Izin lokasi dibutuhkan.');
         setIsScanning(false);
         return;
       }
@@ -478,7 +473,7 @@ export default function App() {
 
       const errorListener = PrintersDiscovery.onError((err) => {
         console.error('Discovery error:', err);
-        Alert.alert('Error Scan', err.message || 'Gagal mencari printer');
+        toast.error(err.message || 'Gagal mencari printer');
         setIsScanning(false);
       });
 
@@ -494,7 +489,7 @@ export default function App() {
       }, 10000);
 
     } catch (e) {
-      Alert.alert('Error', 'Gagal scan printer. Pastikan Bluetooth aktif.');
+      toast.error('Gagal scan printer. Pastikan Bluetooth aktif.');
       console.error(e);
       setIsScanning(false);
     }
@@ -503,12 +498,12 @@ export default function App() {
   const selectPrinter = async (printer) => {
     setSelectedPrinter(printer);
     await SecureStore.setItemAsync('selected_printer', JSON.stringify(printer));
-    Alert.alert('Sukses', `Printer ${printer.name || printer.address} dipilih sebagai default.`);
+    toast.success(`Printer ${printer.name || printer.address} dipilih sebagai default.`);
   };
 
   const testPrint = async () => {
     if (!selectedPrinter) {
-      Alert.alert('Peringatan', 'Pilih printer terlebih dahulu.');
+      toast.warning('Pilih printer terlebih dahulu.');
       return;
     }
 
@@ -533,9 +528,9 @@ export default function App() {
       await client.print(design);
       await client.disconnect();
       
-      Alert.alert('Sukses', 'Test print berhasil dikirim');
+      toast.success('Test print berhasil dikirim');
     } catch (e) {
-      Alert.alert('Error', 'Gagal cetak. Cek koneksi printer.');
+      toast.error('Gagal cetak. Cek koneksi printer.');
       console.error(e);
     }
   };
@@ -619,12 +614,12 @@ export default function App() {
         }
       }
 
-      const now = new Date().toLocaleString();
+      const now = formatDate(new Date());
       setSyncTime(now);
       await SecureStore.setItemAsync('last_sync', now);
     } catch (e) {
       console.error('Sync error:', e);
-      Alert.alert('Offline Mode', 'Gagal sinkronisasi data.');
+      toast.error('Gagal sinkronisasi data.');
     } finally {
       setLoading(false);
     }
@@ -695,14 +690,14 @@ export default function App() {
 
         cart.forEach(item => {
           design = design.text(`${item.name}`);
-          design = design.text(` ${item.qty} x ${item.sell_price.toLocaleString()} = ${(item.qty * item.sell_price).toLocaleString()}`);
+          design = design.text(` ${item.qty} x ${formatNumber(item.sell_price)} = ${formatNumber(item.qty * item.sell_price)}`);
         });
 
         design = design.feed(1)
           .align('center')
           .text('--------------------------------')
           .align('right')
-          .text(`TOTAL: Rp ${total.toLocaleString()}`)
+          .text(`TOTAL: ${formatRp(total)}`)
           .align('center')
           .text('--------------------------------')
           .feed(1)
@@ -714,22 +709,22 @@ export default function App() {
         await client.disconnect();
       } catch (e) {
         console.error('Print Error:', e);
-        Alert.alert('Print Gagal', 'Struk gagal dicetak, namun transaksi tetap tersimpan. Pastikan printer menyala.');
+        toast.error('Struk gagal dicetak, namun transaksi tetap tersimpan. Pastikan printer menyala.');
       }
     }
 
     setCart([]);
     loadOmset();
-    Alert.alert('Sukses', 'Transaksi Berhasil!');
+    toast.success('Transaksi Berhasil!');
   }, [cart, loadOmset, selectedPrinter, storeName, storeContact, storeFooter]);
 
   const kirimBarang = async () => {
     if (!targetBranch) {
-      Alert.alert('Error', 'Pilih cabang tujuan.');
+      toast.error('Pilih cabang tujuan.');
       return;
     }
     if (transferCart.length === 0) {
-      Alert.alert('Error', 'Pilih minimal satu produk.');
+      toast.error('Pilih minimal satu produk.');
       return;
     }
     setLoading(true);
@@ -752,10 +747,10 @@ export default function App() {
       setTransferCart([]);
       setShowKirimModal(false);
       loadTransfers();
-      Alert.alert('Sukses', 'Transfer stok berhasil dikirim.');
+      toast.success('Transfer stok berhasil dikirim.');
     } catch (e) {
       console.error(e);
-      Alert.alert('Error', 'Gagal mengirim transfer stok.');
+      toast.error('Gagal mengirim transfer stok.');
     } finally {
       setLoading(false);
     }
@@ -792,9 +787,9 @@ export default function App() {
         headers: { Authorization: `Bearer ${currentToken}` }
       });
       syncData();
-      Alert.alert('Sukses', 'Barang berhasil diterima.');
+      toast.success('Barang berhasil diterima.');
     } catch (e) {
-      Alert.alert('Error', 'Gagal konfirmasi terima barang.');
+      toast.error('Gagal konfirmasi terima barang.');
     } finally {
       setLoading(false);
     }
@@ -877,7 +872,13 @@ export default function App() {
       <>
         <LoginScreen onLoginSuccess={(userData, token) => {
           useAuthStore.getState().setAuth(userData, token);
-          if (userData.branch) setSelectedBranch(userData.branch);
+          // Kasir locked to their branch_id; Admin gets branch from user
+          if (userData.roles?.[0] === 'Kasir' || userData.roles?.[0] === 'Kasir Cabang') {
+            if (userData.branch) setSelectedBranch(userData.branch);
+            else if (userData.branch_id) setSelectedBranch({ id: userData.branch_id });
+          } else if (userData.branch) {
+            setSelectedBranch(userData.branch);
+          }
           syncData(token);
         }} />
         <Toaster />
@@ -940,7 +941,7 @@ export default function App() {
 
             <View style={styles.omsetCard}>
               <Text style={styles.omsetTitle}>Total Omset</Text>
-              <Text style={styles.omsetValue}>Rp {Number(omset).toLocaleString()}</Text>
+              <Text style={styles.omsetValue}>{formatRp(omset)}</Text>
             </View>
 
             {lowStockProducts.length > 0 && (
@@ -961,7 +962,7 @@ export default function App() {
                 {recentSales.map((s, i) => (
                   <View key={i} style={styles.dashRow}>
                     <Text style={styles.dashRowLabel} numberOfLines={1}>{s.created_at}</Text>
-                    <Text style={styles.dashRowValue}>Rp {Number(s.total).toLocaleString()}</Text>
+                    <Text style={styles.dashRowValue}>{formatRp(s.total)}</Text>
                   </View>
                 ))}
               </View>
@@ -1132,7 +1133,7 @@ export default function App() {
                             style={styles.acceptBtn}
                             onPress={() => {
                               if (user?.roles?.[0] === 'Kasir Cabang') {
-                                Alert.alert('Akses Ditolak', 'Hanya Admin Cabang yang dapat menerima barang.');
+                                toast.error('Hanya Admin Cabang yang dapat menerima barang.');
                                 return;
                               }
                               Alert.alert(
@@ -1203,6 +1204,40 @@ export default function App() {
                 </View>
               </View>
             </View>
+
+            {user?.roles?.[0] !== 'Kasir' && user?.roles?.[0] !== 'Kasir Cabang' && branches.length > 0 && (
+              <View style={styles.settingCard}>
+                <View style={styles.settingRow}>
+                  <Package color="#3b82f6" size={20} />
+                  <View style={{ marginLeft: 15, flex: 1 }}>
+                    <Text style={styles.settingTitle}>Pilih Cabang</Text>
+                    <Text style={styles.settingLabel}>Pilih cabang aktif untuk transaksi dan stok</Text>
+                    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+                      {branches.map((b) => (
+                        <TouchableOpacity
+                          key={b.id}
+                          style={[
+                            styles.printerBtn,
+                            selectedBranch?.id === b.id && styles.activePrinterBtn
+                          ]}
+                          onPress={async () => {
+                            setSelectedBranch(b);
+                            await Storage.setItemAsync('selected_branch_id', b.id.toString());
+                          }}
+                        >
+                          <Text style={[
+                            styles.printerBtnText,
+                            selectedBranch?.id === b.id && styles.activePrinterBtnText
+                          ]}>
+                            {b.name || b.nama_cabang || `Cabang ${b.id}`}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </View>
+                </View>
+              </View>
+            )}
 
             <TouchableOpacity style={styles.settingCard} onPress={() => setShowStockModal(true)}>
               <View style={styles.settingRow}>
@@ -1360,7 +1395,7 @@ export default function App() {
                 <View style={styles.productCard} pointerEvents="none">
                   <View style={styles.pInfo}>
                     <Text style={styles.pName} numberOfLines={1}>{item.name}</Text>
-                    <Text style={styles.pPrice}>Rp {item.sell_price.toLocaleString()}</Text>
+                    <Text style={styles.pPrice}>{formatRp(item.sell_price)}</Text>
                   </View>
                   <View style={styles.pRight}>
                     <Text style={[styles.pStock, {color: item.stock > 0 ? '#22c55e' : '#ef4444'}]}>Stok: {item.stock}</Text>
@@ -1515,7 +1550,7 @@ export default function App() {
 
       {cart.length > 0 && activeTab === 'kasir' && (
         <TouchableOpacity style={styles.cartBar} onPress={checkout}>
-          <Text style={styles.cartText}>{cart.length} Item | Rp {cart.reduce((s, i) => s + (i.sell_price * i.qty), 0).toLocaleString()}</Text>
+          <Text style={styles.cartText}>{cart.length} Item | {formatRp(cart.reduce((s, i) => s + (i.sell_price * i.qty), 0))}</Text>
           <Text style={styles.checkoutText}>BAYAR</Text>
         </TouchableOpacity>
       )}
