@@ -5,8 +5,16 @@ import {
   ScrollView, Modal
 } from 'react-native';
 import { Toaster, toast } from 'sonner-native';
-import * as SQLite from 'expo-sqlite';
 import * as SecureStore from 'expo-secure-store';
+// SQLite loaded lazily — it's native-only and would crash the Web bundle
+let SQLite = null;
+if (Platform.OS !== 'web') {
+  try {
+    SQLite = require('expo-sqlite');
+  } catch (e) {
+    console.warn('expo-sqlite not available, running without SQLite', e);
+  }
+}
 import { FlashList } from "@shopify/flash-list";
 import { Image } from 'expo-image';
 import axios from 'axios';
@@ -38,11 +46,15 @@ const Storage = Platform.OS === 'web' ? {
 } : SecureStore;
 
 // Handle DB sync safely for web
-let db;
-try {
-  db = SQLite.openDatabaseSync('kasir_offline_v2.db');
-} catch (e) {
-  console.warn("SQLite Sync failed, falling back to mock/async", e);
+let db = null;
+if (Platform.OS !== 'web') {
+  try {
+    db = SQLite.openDatabaseSync('kasir_offline_v2.db');
+  } catch (e) {
+    console.warn("SQLite Sync failed, falling back to mock/async", e);
+    db = { execSync: () => {}, getAllSync: () => [], runSync: () => ({ lastInsertRowId: 0, changes: 0 }), getFirstSync: () => ({}), withTransactionSync: (fn) => fn() };
+  }
+} else {
   db = { execSync: () => {}, getAllSync: () => [], runSync: () => ({ lastInsertRowId: 0, changes: 0 }), getFirstSync: () => ({}), withTransactionSync: (fn) => fn() };
 }
 const { width } = Dimensions.get('window');
