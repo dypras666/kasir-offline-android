@@ -332,6 +332,9 @@ export default function App() {
       CREATE TABLE IF NOT EXISTS sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT, total REAL, payment_method TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, synced INTEGER DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS sale_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER, product_id TEXT, qty REAL, price REAL
+      );
     `);
     loadProducts();
   }, [loadProducts]);
@@ -590,6 +593,32 @@ export default function App() {
         });
       }
       loadProducts();
+
+      // Push local sales to server
+      if (Platform.OS !== 'web') {
+        const unsynced = db.getAllSync('SELECT * FROM sales WHERE synced = 0');
+        for (const s of unsynced) {
+          try {
+            const items = db.getAllSync('SELECT * FROM sale_items WHERE sale_id = ?', s.id);
+            await axios.post(`${base}/api/v1/pos/transaction`, {
+              total_amount: s.total,
+              payment_method: s.payment_method,
+              branch_id: branchId,
+              items: items.map(i => ({
+                product_id: i.product_id,
+                qty: i.qty,
+                price: i.price
+              }))
+            }, {
+              headers: { Authorization: `Bearer ${currentToken}` }
+            });
+            db.runSync('UPDATE sales SET synced = 1 WHERE id = ?', s.id);
+          } catch (e) {
+            console.error('Failed to push sale ID:', s.id, e);
+          }
+        }
+      }
+
       const now = new Date().toLocaleString();
       setSyncTime(now);
       await SecureStore.setItemAsync('last_sync', now);
@@ -633,7 +662,14 @@ export default function App() {
         console.error('Web API checkout failed:', e);
       }
     } else {
-      db.runSync('INSERT INTO sales (total, payment_method) VALUES (?, ?)', total, 'CASH');
+      const res = db.runSync('INSERT INTO sales (total, payment_method) VALUES (?, ?)', total, 'CASH');
+      const saleId = res.lastInsertRowId;
+      cart.forEach(item => {
+        db.runSync(
+          'INSERT INTO sale_items (sale_id, product_id, qty, price) VALUES (?, ?, ?, ?)',
+          saleId, item.id, item.qty, item.sell_price
+        );
+      });
     }
     
     // Print receipt if printer is connected
