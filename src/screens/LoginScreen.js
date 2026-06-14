@@ -15,13 +15,8 @@ import { Eye, EyeOff, RefreshCw } from 'lucide-react-native';
 import axios from 'axios';
 import * as SecureStore from 'expo-secure-store';
 import { toast } from 'sonner-native';
-import { login } from '../services/api';
+import { login, Storage } from '../services/api';
 import { useAuthStore } from '../stores/authStore';
-
-const Storage = Platform.OS === 'web' ? {
-  getItemAsync: async (key) => localStorage.getItem(key),
-  setItemAsync: async (key, val) => localStorage.setItem(key, String(val)),
-} : SecureStore;
 
 const ITEMS_PER_PAGE = 5;
 
@@ -160,7 +155,7 @@ export default function LoginScreen({ onLoginSuccess }) {
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       style={styles.container}
     >
       <ScrollView contentContainerStyle={styles.scrollContainer}>

@@ -1,12 +1,5 @@
 import { create } from 'zustand';
-import * as SecureStore from 'expo-secure-store';
-import { Platform } from 'react-native';
-
-const Storage = Platform.OS === 'web' ? {
-  getItemAsync: async (key) => localStorage.getItem(key),
-  setItemAsync: async (key, val) => localStorage.setItem(key, String(val)),
-  deleteItemAsync: async (key) => localStorage.removeItem(key),
-} : SecureStore;
+import { Storage } from '../services/api';
 
 export const useAuthStore = create((set, get) => ({
   user: null,

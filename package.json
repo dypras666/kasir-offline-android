@@ -3,8 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "dependencies": {
+    "@react-native-community/netinfo": "^12.0.1",
     "@shopify/flash-list": "^2.3.2",
     "axios": "^1.17.0",
+    "babel-preset-expo": "^56.0.15",
     "expo": "~56.0.11",
     "expo-build-properties": "~56.0.18",
     "expo-device": "~56.0.4",
@@ -34,7 +36,17 @@
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "test": "node tests/test-expense.js && node tests/test-web-bypass.js && node tests/test-background-sync.js && node tests/test-offline-queue.js",
+    "test:web": "node tests/test-web-bypass.js",
+    "test:sync": "node tests/test-background-sync.js"
   },
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-env": "^7.29.7",
+    "babel-jest": "^30.4.1",
+    "jest": "^30.4.2",
+    "jest-environment-jsdom": "^30.4.1"
+  }
 }

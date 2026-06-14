@@ -5,7 +5,9 @@ import {
   ScrollView, Modal
 } from 'react-native';
 import { Toaster, toast } from 'sonner-native';
-import * as SecureStore from 'expo-secure-store';
+import * as Location from 'expo-location';
+import { startOfflineQueue, stopOfflineQueue } from './src/services/OfflineQueueService';
+
 // SQLite loaded lazily — it's native-only and would crash the Web bundle
 let SQLite = null;
 if (Platform.OS !== 'web') {
@@ -21,7 +23,8 @@ import axios from 'axios';
 import { 
   ShoppingCart, Package, RefreshCw, LogOut, Search, Eye, EyeOff, 
   LayoutDashboard, Settings, User, Printer, Bluetooth, Trash2, CheckCircle,
-  Plus, ArrowRight, ArrowLeft, ChevronRight, ChevronLeft, ArrowDownToLine, ArrowUpFromLine, ListFilter
+  Plus, ArrowRight, ArrowLeft, ChevronRight, ChevronLeft, ArrowDownToLine, ArrowUpFromLine, ListFilter,
+  ScrollText, X, FileText, Ban, AlertTriangle, BookOpen, ClipboardList, ClipboardCheck, RotateCcw, BarChart3
 } from 'lucide-react-native';
 
 // Mock printer for web
@@ -29,21 +32,26 @@ const PrintersDiscovery = Platform.OS === 'web' ? {
   on: () => {}, 
   start: () => {}, 
   stop: () => {} 
-} : require('react-native-esc-pos-printer').PrintersDiscovery;
+} : (() => {
+  try {
+    return require('react-native-esc-pos-printer').PrintersDiscovery;
+  } catch (e) {
+    console.warn('PrintersDiscovery not available:', e);
+    return { on: () => {}, start: () => {}, stop: () => {} };
+  }
+})();
 
 const PrintModule = Platform.OS === 'web' ? {
   init: () => {},
   print: () => {}
-} : require('react-native-esc-pos-printer').Printer;
-
-import * as Location from 'expo-location';
-
-// Universal storage: SecureStore for native, localStorage for web
-const Storage = Platform.OS === 'web' ? {
-  getItemAsync: async (key) => localStorage.getItem(key),
-  setItemAsync: async (key, val) => localStorage.setItem(key, String(val)),
-  deleteItemAsync: async (key) => localStorage.removeItem(key),
-} : SecureStore;
+} : (() => {
+  try {
+    return require('react-native-esc-pos-printer').Printer;
+  } catch (e) {
+    console.warn('Printer not available:', e);
+    return { init: () => {}, print: () => {} };
+  }
+})();
 
 // Handle DB sync safely for web
 let db = null;
@@ -110,8 +118,40 @@ const TransferItem = React.memo(({ item, onAccept, userRole }) => (
 
 import { formatNumber, formatRp, formatDate } from './src/utils/format';
 import LoginScreen from './src/screens/LoginScreen';
-import { getBaseUrl, removeAuthData } from './src/services/api';
+import { getBaseUrl, removeAuthData, Storage } from './src/services/api';
 import { useAuthStore } from './src/stores/authStore';
+import { startBackgroundSync, stopBackgroundSync } from './src/services/backgroundSync';
+import { createLostInventoryTable, saveLostInventory, getLostInventoryLocal } from './src/services/LostInventoryService';
+import { createExpenseTable } from './src/services/ExpenseService';
+import { ReturnService } from './src/services/ReturnService';
+import { PurchaseReturnService } from './src/services/PurchaseReturnService';
+import ReturnScreen from './src/screens/retur/ReturnScreen';
+import ReturnFormScreen from './src/screens/retur/ReturnFormScreen';
+import SalesReturnScreen from './src/screens/retur/SalesReturnScreen';
+import ExpenseScreen from './src/screens/ExpenseScreen';
+import ExpenseHistoryScreen from './src/screens/ExpenseHistoryScreen';
+import OpenShiftScreen from './src/screens/shift/OpenShiftScreen';
+import CloseShiftScreen from './src/screens/shift/CloseShiftScreen';
+import ShiftHistoryScreen from './src/screens/shift/ShiftHistoryScreen';
+import { ShiftService } from './src/services/ShiftService';
+import PurchaseOrderScreen from './src/screens/purchase-order/PurchaseOrderScreen';
+import PurchaseOrderDetailScreen from './src/screens/purchase-order/PurchaseOrderDetailScreen';
+import PurchaseOrderFormScreen from './src/screens/purchase-order/PurchaseOrderFormScreen';
+import PurchaseReturnListScreen from './src/screens/purchase-order/PurchaseReturnListScreen';
+import PurchaseReturnFormScreen from './src/screens/purchase-order/PurchaseReturnFormScreen';
+
+// Stok Opname
+import StokOpnameListScreen from './src/screens/stok-opname/StokOpnameListScreen';
+import StokOpnameFormScreen from './src/screens/stok-opname/StokOpnameFormScreen';
+import StokOpnameDetailScreen from './src/screens/stok-opname/StokOpnameDetailScreen';
+import { createStokOpnameTable } from './src/services/StokOpnameService';
+
+import PaymentMethodPicker from './src/components/PaymentMethodPicker';
+import DailySalesRecapScreen from './src/screens/DailySalesRecapScreen';
+import CustomerScreen from './src/screens/customer/CustomerScreen';
+import CustomerPicker from './src/components/CustomerPicker';
+import { CustomerService } from './src/services/customer/CustomerService';
+import ErrorBoundary from './src/components/ErrorBoundary';
 
 export default function App() {
   const { isLoggedIn, user, initAuth, logout } = useAuthStore();
@@ -139,11 +179,15 @@ export default function App() {
   const [products, setProducts] = useState([]);
   const [transfers, setTransfers] = useState([]);
   const [cart, setCart] = useState([]);
+  const [showCartModal, setShowCartModal] = useState(false);
+  const [cartModalTab, setCartModalTab] = useState('list'); // 'list' or 'discount'
   const [search, setSearch] = useState('');
   const [transferFilter, setTransferFilter] = useState('pending'); // pending, completed, all
   const [transferSource, setTransferSource] = useState('all'); // all, or source name
   const [transferDateFilter, setTransferDateFilter] = useState('all'); // all, today, month
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [selectedCustomer, setSelectedCustomer] = useState(null);
+  const [showCustomerPicker, setShowCustomerPicker] = useState(false);
   const [transferSubTab, setTransferSubTab] = useState('terima'); // terima or kirim
   const [showKirimModal, setShowKirimModal] = useState(false);
   const [transferCart, setTransferCart] = useState([]);
@@ -158,6 +202,12 @@ export default function App() {
     status: true,
     actions: true
   });
+  
+  // Shift state
+  const [currentShift, setCurrentShift] = useState(null);
+  const [showOpenShiftModal, setShowOpenShiftModal] = useState(false);
+  const [showCloseShiftModal, setShowCloseShiftModal] = useState(false);
+  const [shiftLoading, setShiftLoading] = useState(false);
   const [modalProductSearch, setModalProductSearch] = useState('');
   const [dateFilter, setDateFilter] = useState('today');
   const [omset, setOmset] = useState(0);
@@ -168,10 +218,53 @@ export default function App() {
   const [todayCount, setTodayCount] = useState(0);
   const [recentSales, setRecentSales] = useState([]);
 
+  // Payment states
+  const [payments, setPayments] = useState([]);
+  const [showPaymentPicker, setShowPaymentPicker] = useState(false);
+  const [activePaymentIndex, setActivePaymentIndex] = useState(null);
+
+  // Riwayat Penjualan tab state
+  const [salesList, setSalesList] = useState([]);
+  const [salesSearch, setSalesSearch] = useState('');
+  const [salesPage, setSalesPage] = useState(1);
+  const [salesPerPage, setSalesPerPage] = useState(15);
+  const [salesFilter, setSalesFilter] = useState('all'); // all, today, month, voided
+  const [selectedSale, setSelectedSale] = useState(null);
+  const [showSaleDetail, setShowSaleDetail] = useState(false);
+  const [saleDetailItems, setSaleDetailItems] = useState([]);
+  const [voidLoading, setVoidLoading] = useState(false);
+
+  // Retur state
+  const [showReturScreen, setShowReturScreen] = useState(false);
+  const [showReturFormScreen, setShowReturFormScreen] = useState(false);
+  const [selectedSaleForReturn, setSelectedSaleForReturn] = useState(null);
+  
+  // Rekap Penjualan state
+  // (uses activeTab === 'recap')
+
+  // Purchase Order state
+  const [selectedPO, setSelectedPO] = useState(null);
+  const [editPO, setEditPO] = useState(null);
+
+  // Stok Opname state
+  const [selectedStokOpnameId, setSelectedStokOpnameId] = useState(null);
+
+  // Lost Inventory state
+  const [lostList, setLostList] = useState([]);
+  const [showLostModal, setShowLostModal] = useState(false);
+  const [selectedProductForLost, setSelectedProductForLost] = useState(null);
+  const [lostQty, setLostQty] = useState('1');
+  const [lossType, setLossType] = useState('hilang'); // hilang or rusak
+  const [lostNote, setLostNote] = useState('');
+
   useEffect(() => {
     initDB();
     initAuth();
     checkSavedLogin();
+    loadLostHistory();
+    
+    // Start background queue runner for offline transaction sync
+    startBackgroundSync();
     
     // Splash screen timer
     setTimeout(() => {
@@ -181,40 +274,50 @@ export default function App() {
         useNativeDriver: true,
       }).start(() => setIsSplashVisible(false));
     }, 2000);
+    
+    return () => {
+      stopBackgroundSync();
+    };
   }, []);
 
-  const checkSavedLogin = async () => {
-    let savedEmail, savedPass, savedSync, savedPrinter, savedPrinterData, savedStoreName, savedStoreContact, savedStoreFooter, savedMode, savedIp, savedServerName, savedToken, savedUser;
-    
-    if (Platform.OS === 'web') {
-      savedEmail = localStorage.getItem('user_email');
-      savedPass = localStorage.getItem('user_pass');
-      savedSync = localStorage.getItem('last_sync');
-      savedPrinter = localStorage.getItem('printer_size');
-      savedPrinterData = localStorage.getItem('selected_printer');
-      savedStoreName = localStorage.getItem('store_name');
-      savedStoreContact = localStorage.getItem('store_contact');
-      savedStoreFooter = localStorage.getItem('store_footer');
-      savedMode = localStorage.getItem('server_mode');
-      savedIp = localStorage.getItem('local_server_ip');
-      savedServerName = localStorage.getItem('local_server_name');
-      savedToken = localStorage.getItem('user_token');
-      savedUser = localStorage.getItem('user_data');
-    } else {
-      savedEmail = await SecureStore.getItemAsync('user_email');
-      savedPass = await SecureStore.getItemAsync('user_pass');
-      savedSync = await SecureStore.getItemAsync('last_sync');
-      savedPrinter = await SecureStore.getItemAsync('printer_size');
-      savedPrinterData = await SecureStore.getItemAsync('selected_printer');
-      savedStoreName = await SecureStore.getItemAsync('store_name');
-      savedStoreContact = await SecureStore.getItemAsync('store_contact');
-      savedStoreFooter = await SecureStore.getItemAsync('store_footer');
-      savedMode = await SecureStore.getItemAsync('server_mode');
-      savedIp = await SecureStore.getItemAsync('local_server_ip');
-      savedServerName = await SecureStore.getItemAsync('local_server_name');
-      savedToken = await SecureStore.getItemAsync('user_token');
-      savedUser = await SecureStore.getItemAsync('user_data');
+  // Check shift status for Kasir after login
+  useEffect(() => {
+    if (isLoggedIn && user && (user.roles?.[0] === 'Kasir' || user.roles?.[0] === 'Kasir Cabang')) {
+      checkCurrentShift();
     }
+  }, [isLoggedIn, user]);
+
+  const checkCurrentShift = async () => {
+    setShiftLoading(true);
+    try {
+      const shift = await ShiftService.getCurrentShift();
+      if (shift && shift.status === 'open') {
+        setCurrentShift(shift);
+      } else {
+        setCurrentShift(null);
+        setShowOpenShiftModal(true);
+      }
+    } catch (e) {
+      console.error('Check shift error:', e);
+    } finally {
+      setShiftLoading(false);
+    }
+  };
+
+  const checkSavedLogin = async () => {
+    const savedEmail = await Storage.getItemAsync('user_email');
+    const savedPass = await Storage.getItemAsync('user_pass');
+    const savedSync = await Storage.getItemAsync('last_sync');
+    const savedPrinter = await Storage.getItemAsync('printer_size');
+    const savedPrinterData = await Storage.getItemAsync('selected_printer');
+    const savedStoreName = await Storage.getItemAsync('store_name');
+    const savedStoreContact = await Storage.getItemAsync('store_contact');
+    const savedStoreFooter = await Storage.getItemAsync('store_footer');
+    const savedMode = await Storage.getItemAsync('server_mode');
+    const savedIp = await Storage.getItemAsync('local_server_ip');
+    const savedServerName = await Storage.getItemAsync('local_server_name');
+    const savedToken = await Storage.getItemAsync('user_token');
+    const savedUser = await Storage.getItemAsync('user_data');
 
     if (savedMode) {
       setServerMode(savedMode);
@@ -337,19 +440,25 @@ export default function App() {
         id INTEGER PRIMARY KEY AUTOINCREMENT, transfer_id TEXT, product_name TEXT, qty REAL, unit_name TEXT
       );
       CREATE TABLE IF NOT EXISTS sales (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, total REAL, payment_method TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, synced INTEGER DEFAULT 0
+        id INTEGER PRIMARY KEY AUTOINCREMENT, total REAL, payment_method TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, synced INTEGER DEFAULT 0, subtotal REAL DEFAULT 0, discount_type TEXT DEFAULT 'none', discount_value REAL DEFAULT 0, branch_id TEXT DEFAULT '', payments TEXT DEFAULT '[]', customer_id TEXT DEFAULT NULL
       );
       CREATE TABLE IF NOT EXISTS sale_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER, product_id TEXT, qty REAL, price REAL
+        id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER, product_id TEXT, qty REAL, price REAL, discount_type TEXT DEFAULT 'none', discount_value REAL DEFAULT 0, subtotal REAL DEFAULT 0
       );
     `);
+    createLostInventoryTable();
+    createExpenseTable();
+    CustomerService.createTable();
+    ReturnService.createTable();
+    PurchaseReturnService.createTable();
+    createStokOpnameTable();
     loadProducts();
   }, [loadProducts]);
 
   const loadProducts = useCallback(async () => {
     if (Platform.OS === 'web') {
       try {
-        const token = localStorage.getItem('user_token');
+        const token = await Storage.getItemAsync('user_token');
         if (!token) return;
         const baseUrl = await getBaseUrl();
         const branchId = selectedBranch?.id || 1;
@@ -426,8 +535,23 @@ export default function App() {
 
   const loadOmset = useCallback(async () => {
     if (Platform.OS === 'web') {
-      // For web demo, dummy or simple calculate from API if available
-      setOmset(0);
+      try {
+        const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+        const sales = JSON.parse(salesStr);
+        let filtered = sales;
+        if (dateFilter === 'today') {
+          const today = new Date().toISOString().split('T')[0];
+          filtered = sales.filter(s => s.created_at.startsWith(today));
+        } else if (dateFilter === 'month') {
+          const thisMonth = new Date().toISOString().substring(0, 7);
+          filtered = sales.filter(s => s.created_at.startsWith(thisMonth));
+        }
+        const total = filtered.reduce((sum, s) => sum + Number(s.total), 0);
+        setOmset(total);
+      } catch (e) {
+        console.error('loadOmset web error:', e);
+        setOmset(0);
+      }
     } else {
       let query = 'SELECT SUM(total) as total FROM sales';
       if (dateFilter === 'today') query += " WHERE date(created_at) = date('now')";
@@ -438,10 +562,219 @@ export default function App() {
     }
   }, [dateFilter]);
 
+  const loadSalesHistory = useCallback(async () => {
+    try {
+      const token = await Storage.getItemAsync('user_token');
+      const branchId = selectedBranch?.id || user?.branch_id || 1;
+      let loadedSales = [];
+
+      if (!token) {
+        if (Platform.OS !== 'web') {
+          loadedSales = db.getAllSync('SELECT * FROM sales ORDER BY created_at DESC');
+        } else {
+          const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+          loadedSales = JSON.parse(salesStr).sort((a,b) => b.created_at.localeCompare(a.created_at));
+        }
+      } else {
+        try {
+          const baseUrl = await getBaseUrl();
+          const resp = await axios.get(`${baseUrl}/api/v1/sales?branch_id=${branchId}&per_page=100`, {
+            headers: { Authorization: `Bearer ${token}` },
+            timeout: 8000
+          });
+          loadedSales = resp.data.data || resp.data; // adjust based on pagination structure
+        } catch(apiErr) {
+          console.warn('Realtime online sales history failed, fallback to local:', apiErr);
+          if (Platform.OS !== 'web') {
+            loadedSales = db.getAllSync('SELECT * FROM sales ORDER BY created_at DESC');
+          } else {
+            const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+            loadedSales = JSON.parse(salesStr).sort((a,b) => b.created_at.localeCompare(a.created_at));
+          }
+        }
+      }
+      
+      const mappedSales = loadedSales.map(s => ({
+        id: s.id,
+        invoice_number: s.invoice_number || `INV-${s.id}`,
+        total: s.total_amount || s.total,
+        status: s.status || (s.synced === 0 ? 'pending_sync' : 'completed'),
+        created_at: s.created_at || new Date().toISOString(),
+        payment_method: s.payment_method || 'CASH',
+        payments: s.payments || [],
+        synced: s.synced
+      }));
+      
+      setSalesList(mappedSales);
+    } catch(err) {
+      console.error('Failed to load sales history:', err);
+    }
+  }, [selectedBranch, user]);
+
+  const loadLostHistory = useCallback(async () => {
+    const list = await getLostInventoryLocal();
+    setLostList(list);
+  }, []);
+
+  const reportLost = async () => {
+    if (!selectedProductForLost || !lostQty || parseFloat(lostQty) <= 0) {
+      toast.error('Data tidak valid.');
+      return;
+    }
+    setLoading(true);
+    try {
+      await saveLostInventory({
+        product_id: selectedProductForLost.id,
+        product_name: selectedProductForLost.name,
+        qty: parseFloat(lostQty),
+        loss_type: lossType,
+        note: lostNote,
+      });
+      setShowLostModal(false);
+      setSelectedProductForLost(null);
+      setLostQty('1');
+      setLostNote('');
+      loadLostHistory();
+      toast.success('Laporan berhasil disimpan offline.');
+      
+      // Try sync if online
+      const netInfo = require('@react-native-community/netinfo').default;
+      const netState = await netInfo.fetch();
+      if (netState.isConnected && netState.isInternetReachable !== false) {
+        const { pushUnsyncedLostInventory } = require('./src/services/LostInventoryService');
+        pushUnsyncedLostInventory().then(() => loadLostHistory());
+      }
+    } catch (e) {
+      console.error(e);
+      toast.error('Gagal simpan laporan.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadSaleDetail = useCallback(async (saleId) => {
+    try {
+      const token = await Storage.getItemAsync('user_token');
+      let items = [];
+
+      if (Platform.OS !== 'web' && !token) {
+        items = db.getAllSync('SELECT * FROM sale_items WHERE sale_id = ?', [saleId]);
+      } else if (token) {
+        try {
+          const baseUrl = await getBaseUrl();
+          const resp = await axios.get(`${baseUrl}/api/v1/sales/${saleId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            timeout: 8000
+          });
+          items = resp.data.items || resp.data.sale_items || [];
+          if (Platform.OS !== 'web') {
+            db.withTransactionSync(() => {
+              db.execSync('DELETE FROM sale_items WHERE sale_id = ?', [saleId]);
+              items.forEach(i => {
+                db.runSync(
+                  'INSERT INTO sale_items (sale_id, product_id, qty, price, subtotal) VALUES (?, ?, ?, ?, ?)',
+                  [saleId, i.product_id, i.qty, i.price, i.subtotal || (i.qty * i.price)]
+                );
+              });
+            });
+          }
+        } catch(apiErr) {
+          console.warn('Load detail API failed, fallback local:', apiErr);
+          if (Platform.OS !== 'web') {
+            items = db.getAllSync('SELECT * FROM sale_items WHERE sale_id = ?', [saleId]);
+          }
+        }
+      }
+
+      setSaleDetailItems(items.map(i => ({
+        ...i,
+        product_name: i.product_name || i.name || `Produk #${i.product_id}`,
+        qty: i.qty,
+        price: i.price,
+        subtotal: i.subtotal || (i.qty * i.price)
+      })));
+    } catch(err) {
+      console.error('Failed to load sale detail:', err);
+      setSaleDetailItems([]);
+    }
+  }, []);
+
+  const voidSale = useCallback(async (sale) => {
+    if (!sale || !sale.id) return;
+    
+    Alert.alert(
+      'Void Transaksi',
+      `Yakin ingin void invoice ${sale.invoice_number}?\nTotal: ${formatRp(sale.total)}`,
+      [
+        { text: 'Batal', style: 'cancel' },
+        { text: 'Ya, Void', style: 'destructive', onPress: async () => {
+            setVoidLoading(true);
+            try {
+              const netInfo = require('@react-native-community/netinfo').default;
+              const netState = await netInfo.fetch();
+              const isOnline = netState.isConnected && netState.isInternetReachable !== false;
+              const token = await Storage.getItemAsync('user_token');
+
+              if (isOnline && token) {
+                const baseUrl = await getBaseUrl();
+                await axios.post(`${baseUrl}/api/v1/sales/${sale.id}/void`, {}, {
+                  headers: { Authorization: `Bearer ${token}` },
+                  timeout: 8000
+                });
+                if (Platform.OS !== 'web') {
+                  db.runSync('UPDATE sales SET status = ? WHERE id = ?', ['voided', sale.id]);
+                } else {
+                  const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+                  let sales = JSON.parse(salesStr);
+                  sales = sales.map(s => s.id === sale.id ? { ...s, status: 'voided' } : s);
+                  await Storage.setItemAsync('local_sales', JSON.stringify(sales));
+                }
+              } else {
+                // Offline: save void request to queue
+                const voidQueueStr = await Storage.getItemAsync('void_queue') || '[]';
+                let voidQueue = JSON.parse(voidQueueStr);
+                voidQueue.push({ sale_id: sale.id, invoice_number: sale.invoice_number, created_at: new Date().toISOString() });
+                await Storage.setItemAsync('void_queue', JSON.stringify(voidQueue));
+                if (Platform.OS !== 'web') {
+                  db.runSync('UPDATE sales SET status = ? WHERE id = ?', ['void_pending', sale.id]);
+                } else {
+                  const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+                  let sales = JSON.parse(salesStr);
+                  sales = sales.map(s => s.id === sale.id ? { ...s, status: 'void_pending' } : s);
+                  await Storage.setItemAsync('local_sales', JSON.stringify(sales));
+                }
+              }
+              
+              toast.success(`Invoice ${sale.invoice_number} berhasil di-void`);
+              await loadSalesHistory();
+            } catch(err) {
+              console.error('Void sale failed:', err);
+              toast.error('Gagal void invoice: ' + (err.message || 'Unknown error'));
+            } finally {
+              setVoidLoading(false);
+            }
+          }
+        }
+      ]
+    );
+  }, [loadSalesHistory]);
+
   const loadDashboardStats = useCallback(async () => {
     if (Platform.OS === 'web') {
-      setTodayCount(0);
-      setRecentSales([]);
+      try {
+        const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+        const sales = JSON.parse(salesStr);
+        const today = new Date().toISOString().split('T')[0];
+        const todaySales = sales.filter(s => s.created_at.startsWith(today));
+        setTodayCount(todaySales.length);
+        
+        const sorted = [...sales].sort((a, b) => b.created_at.localeCompare(a.created_at));
+        setRecentSales(sorted.slice(0, 5));
+      } catch (e) {
+        console.error('loadDashboardStats web error:', e);
+        setTodayCount(0);
+        setRecentSales([]);
+      }
       return;
     }
     try {
@@ -456,9 +789,13 @@ export default function App() {
     }
   }, []);
 
-  const lowStockProducts = useMemo(() => {
-    return products.filter(p => Number(p.stock) <= 5).slice(0, 10);
-  }, [products]);
+  useEffect(() => {
+    startOfflineQueue();
+    return () => stopOfflineQueue();
+  }, []);
+
+  const refreshData = async (forceSync = false, showToast = true) => {
+    if (isRefreshing) return;
 
   const scanPrinters = async () => {
     setIsScanning(true);
@@ -508,9 +845,9 @@ export default function App() {
   };
 
   const selectPrinter = async (printer) => {
-    setSelectedPrinter(printer);
-    await SecureStore.setItemAsync('selected_printer', JSON.stringify(printer));
-    toast.success(`Printer ${printer.name || printer.address} dipilih sebagai default.`);
+  setSelectedPrinter(printer);
+  await Storage.setItemAsync('selected_printer', JSON.stringify(printer));
+  toast.success(`Printer ${printer.name || printer.address} dipilih sebagai default.`);
   };
 
   const testPrint = async () => {
@@ -551,8 +888,9 @@ export default function App() {
     if (isLoggedIn) {
       loadOmset();
       loadDashboardStats();
+      loadSalesHistory();
     }
-  }, [loadOmset, loadDashboardStats, isLoggedIn, activeTab]);
+  }, [loadOmset, loadDashboardStats, loadSalesHistory, isLoggedIn, activeTab]);
 
   const handleLogout = () => {
     Alert.alert('Logout', 'Yakin ingin keluar?', [
@@ -567,7 +905,7 @@ export default function App() {
   const syncData = async (token) => {
     setLoading(true);
     try {
-      const currentToken = token || (Platform.OS === 'web' ? localStorage.getItem('user_token') : await SecureStore.getItemAsync('user_token'));
+      const currentToken = token || await Storage.getItemAsync('user_token');
       const base = await getBaseUrl();
       const branchId = selectedBranch?.id || user?.branch_id || 1;
       
@@ -602,19 +940,61 @@ export default function App() {
       loadProducts();
 
       // Push local sales to server
-      if (Platform.OS !== 'web') {
+      if (Platform.OS === 'web') {
+        try {
+          const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+          let sales = JSON.parse(salesStr);
+          let updated = false;
+          for (const s of sales) {
+            if (s.synced === 0) {
+              try {
+                await axios.post(`${base}/api/v1/sales`, {
+                  total_amount: s.total,
+                  subtotal: s.subtotal || s.total,
+                  discount_type: s.discount_type || 'none',
+                  discount_value: s.discount_value || 0,
+                  payment_method: s.payment_method,
+                  payments: s.payments && s.payments.length > 0 ? s.payments : [{ payment_method_id: s.payment_method || 'CASH', amount: s.total }],
+                  branch_id: s.branch_id || branchId,
+                  customer_id: s.customer_id || null,
+                  items: s.items
+                }, {
+                  headers: { Authorization: `Bearer ${currentToken}` }
+                });
+                s.synced = 1;
+                updated = true;
+              } catch (err) {
+                console.error('Web sync failed for sale ID:', s.id, err);
+              }
+            }
+          }
+          if (updated) {
+            await Storage.setItemAsync('local_sales', JSON.stringify(sales));
+          }
+        } catch (e) {
+          console.error('Web sync sales error:', e);
+        }
+      } else {
         const unsynced = db.getAllSync('SELECT * FROM sales WHERE synced = 0');
         for (const s of unsynced) {
           try {
             const items = db.getAllSync('SELECT * FROM sale_items WHERE sale_id = ?', s.id);
-            await axios.post(`${base}/api/v1/pos/transaction`, {
+            await axios.post(`${base}/api/v1/sales`, {
               total_amount: s.total,
+              subtotal: s.subtotal || s.total,
+              discount_type: s.discount_type || 'none',
+              discount_value: s.discount_value || 0,
               payment_method: s.payment_method,
-              branch_id: branchId,
+              payments: s.payments && s.payments.length > 0 ? JSON.parse(typeof s.payments === 'string' ? s.payments : JSON.stringify(s.payments || [])) : [{ payment_method_id: s.payment_method || 'CASH', amount: s.total }],
+              branch_id: s.branch_id || branchId,
+              customer_id: s.customer_id || null,
               items: items.map(i => ({
                 product_id: i.product_id,
                 qty: i.qty,
-                price: i.price
+                price: i.price,
+                discount_type: i.discount_type || 'none',
+                discount_value: i.discount_value || 0,
+                subtotal: i.subtotal || (i.price * i.qty)
               }))
             }, {
               headers: { Authorization: `Bearer ${currentToken}` }
@@ -628,7 +1008,7 @@ export default function App() {
 
       const now = formatDate(new Date());
       setSyncTime(now);
-      await SecureStore.setItemAsync('last_sync', now);
+      await Storage.setItemAsync('last_sync', now);
     } catch (e) {
       console.error('Sync error:', e);
       toast.error('Gagal sinkronisasi data.');
@@ -641,40 +1021,147 @@ export default function App() {
     setCart(prev => {
       const existing = prev.find(item => item.id === p.id);
       if (existing) return prev.map(item => item.id === p.id ? { ...item, qty: item.qty + 1 } : item);
-      return [...prev, { ...p, qty: 1 }];
+      return [...prev, { ...p, qty: 1, discount_type: 'none', discount_value: 0, price_override: null }];
     });
   }, []);
 
+  // Per-item discount and price override helpers
+  const updateCartItemDiscount = useCallback((itemId, field, value) => {
+    setCart(prev => prev.map(item => item.id === itemId ? { ...item, [field]: value } : item));
+  }, []);
+  const updateCartItemPriceOverride = useCallback((itemId, value) => {
+    setCart(prev => prev.map(item => item.id === itemId ? { ...item, price_override: value } : item));
+  }, []);
+  const removeFromCart = useCallback((itemId) => {
+    setCart(prev => prev.filter(i => i.id !== itemId));
+  }, []);
+
+  const getCartTotal = useCallback(() => {
+    return cart.reduce((s, i) => {
+      const bp = i.price_override != null ? i.price_override : i.sell_price;
+      const lt = bp * i.qty;
+      let dv = Number(i.discount_value) || 0;
+      let dt = i.discount_type || 'none';
+      if (dt === 'percent' && dv > 0) return s + (lt - (lt * dv / 100));
+      if (dt === 'flat' && dv > 0) return s + Math.max(0, lt - dv);
+      return s + lt;
+    }, 0);
+  }, [cart]);
+
   const checkout = useCallback(async () => {
     if (cart.length === 0) return;
-    const total = cart.reduce((sum, item) => sum + (item.sell_price * item.qty), 0);
+
+    // Use selected payments or default to CASH if empty
+    let finalPayments = payments.length > 0 ? payments : [
+      { payment_method_id: 'CASH', amount: getCartTotal() }
+    ];
+
+    // Validate payment sum matches total
+    const paymentSum = finalPayments.reduce((sum, p) => sum + p.amount, 0);
+    const total = getCartTotal();
     
+    if (Math.abs(paymentSum - total) > 0.01) {
+      toast.error(`Total bayar (${formatRp(paymentSum)}) tidak sama dengan total belanja (${formatRp(total)})`);
+      return;
+    }
+
+    // Compute per-item subtotals with discount and price override
+    const itemsWithSubtotals = cart.map(item => {
+      const basePrice = item.price_override != null ? item.price_override : item.sell_price;
+      const lineTotal = basePrice * item.qty;
+      let discountValue = Number(item.discount_value) || 0;
+      let discountType = item.discount_type || 'none';
+      let subtotal = lineTotal;
+      if (discountType === 'percent' && discountValue > 0) {
+        subtotal = lineTotal - (lineTotal * discountValue / 100);
+      } else if (discountType === 'flat' && discountValue > 0) {
+        subtotal = Math.max(0, lineTotal - discountValue);
+      }
+      return {
+        product_id: item.id,
+        qty: item.qty,
+        price: basePrice,
+        discount_type: discountType,
+        discount_value: discountValue,
+        subtotal: subtotal
+      };
+    });
+    const computedTotal = itemsWithSubtotals.reduce((sum, i) => sum + i.subtotal, 0);
+    const subtotalSum = cart.reduce((sum, i) => {
+      const bp = i.price_override != null ? i.price_override : i.sell_price;
+      return sum + (bp * i.qty);
+    }, 0);
+    const branchId = selectedBranch?.id ? String(selectedBranch.id) : (String(user?.branch_id) || '1');
+    const branchIdStr = branchId || '1';
+
     if (Platform.OS === 'web') {
+      // Try API push first, then always save local_sales for omset/stats
+      let apiSuccess = false;
       try {
-        const token = localStorage.getItem('user_token');
-        if (!token) return;
-        const baseUrl = await getBaseUrl();
-        await axios.post(`${baseUrl}/api/v1/pos/transaction`, {
-          total_amount: total,
-          payment_method: 'CASH',
-          items: cart.map(item => ({
-            product_id: item.id,
-            qty: item.qty,
-            price: item.sell_price
-          }))
-        }, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        const token = await Storage.getItemAsync('user_token');
+        if (token) {
+          const baseUrl = await getBaseUrl();
+          await axios.post(`${baseUrl}/api/v1/sales`, {
+            total_amount: total,
+            subtotal: subtotalSum,
+            discount_type: cart.some(i => i.discount_type !== 'none' && i.discount_value > 0) ? 'mixed' : 'none',
+            discount_value: 0,
+            payment_method: finalPayments.length === 1 ? finalPayments[0].payment_method_id : 'SPLIT',
+            payments: finalPayments.map(p => ({
+              payment_method_id: p.payment_method_id,
+              amount: p.amount
+            })),
+            branch_id: branchIdStr,
+            customer_id: selectedCustomer?.id || null,
+            items: itemsWithSubtotals
+          }, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          apiSuccess = true;
+        }
       } catch (e) {
-        console.error('Web API checkout failed:', e);
+        console.error('Web API checkout failed, falling back to local save:', e);
+      }
+      // Save transaction locally for omset/stats dashboard
+      try {
+        const salesStr = await Storage.getItemAsync('local_sales') || '[]';
+        const sales = JSON.parse(salesStr);
+        sales.push({
+          id: Date.now(),
+          total,
+          subtotal: subtotalSum,
+          discount_type: cart.some(i => i.discount_type !== 'none' && i.discount_value > 0) ? 'mixed' : 'none',
+          discount_value: 0,
+          payment_method: finalPayments.length === 1 ? finalPayments[0].payment_method_id : 'SPLIT',
+          payments: finalPayments.map(p => ({
+            payment_method_id: p.payment_method_id,
+            amount: p.amount
+          })),
+          branch_id: branchIdStr,
+          customer_id: selectedCustomer?.id || null,
+          created_at: new Date().toISOString(),
+          items: itemsWithSubtotals,
+          synced: apiSuccess ? 1 : 0
+        });
+        await Storage.setItemAsync('local_sales', JSON.stringify(sales));
+      } catch (e) {
+        console.error('Failed to save local sales on web:', e);
       }
     } else {
-      const res = db.runSync('INSERT INTO sales (total, payment_method) VALUES (?, ?)', total, 'CASH');
+      const paymentsJson = JSON.stringify(finalPayments.map(p => ({
+        payment_method_id: p.payment_method_id,
+        amount: p.amount
+      })));
+      const res = db.runSync(
+        'INSERT INTO sales (total, subtotal, discount_type, discount_value, payment_method, branch_id, payments, customer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        total, subtotalSum, cart.some(i => i.discount_type !== 'none' && i.discount_value > 0) ? 'mixed' : 'none', 0, 
+        finalPayments.length === 1 ? finalPayments[0].payment_method_id : 'SPLIT', branchIdStr, paymentsJson, selectedCustomer?.id || null
+      );
       const saleId = res.lastInsertRowId;
-      cart.forEach(item => {
+      itemsWithSubtotals.forEach(item => {
         db.runSync(
-          'INSERT INTO sale_items (sale_id, product_id, qty, price) VALUES (?, ?, ?, ?)',
-          saleId, item.id, item.qty, item.sell_price
+          'INSERT INTO sale_items (sale_id, product_id, qty, price, discount_type, discount_value, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          saleId, item.product_id, item.qty, item.price, item.discount_type, item.discount_value, item.subtotal
         );
       });
     }
@@ -726,9 +1213,10 @@ export default function App() {
     }
 
     setCart([]);
+    setPayments([]);
     loadOmset();
     toast.success('Transaksi Berhasil!');
-  }, [cart, loadOmset, selectedPrinter, storeName, storeContact, storeFooter]);
+  }, [cart, loadOmset, selectedPrinter, storeName, storeContact, storeFooter, payments, getCartTotal]);
 
   const kirimBarang = async () => {
     if (!targetBranch) {
@@ -793,7 +1281,7 @@ export default function App() {
   const terimaBarang = async (id) => {
     setLoading(true);
     try {
-      const currentToken = await SecureStore.getItemAsync('user_token');
+      const currentToken = await Storage.getItemAsync('user_token');
       const baseUrl = await getBaseUrl();
       await axios.post(`${baseUrl}/api/v1/stock-transfers/${id}/complete`, {}, {
         headers: { Authorization: `Bearer ${currentToken}` }
@@ -907,6 +1395,21 @@ export default function App() {
       case 'dashboard': return 'Dashboard';
       case 'kasir': return 'Kasir';
       case 'transfer': return 'Kiriman Stok';
+      case 'riwayat': return 'Riwayat Penjualan';
+      case 'lost': return 'Barang Hilang/Rusak';
+      case 'retur': return 'Retur Penjualan';
+      case 'returForm': return 'Form Retur';
+      case 'shift': return 'Riwayat Shift';
+      case 'purchaseOrder': return 'Purchase Order';
+      case 'purchaseOrderDetail': return 'Detail PO';
+      case 'purchaseOrderForm': return editPO ? 'Edit PO' : 'Buat PO';
+      case 'purchaseReturns': return 'Retur Pembelian';
+      case 'purchaseReturnForm': return 'Form Retur Pembelian';
+      case 'stokOpname': return 'Stok Opname';
+      case 'stokOpnameDetail': return 'Detail Stok Opname';
+      case 'stokOpnameForm': return 'Buat Stok Opname';
+      case 'recap': return 'Rekap Penjualan Harian';
+      case 'pelanggan': return 'Data Pelanggan';
       case 'settings': return 'Pengaturan';
       default: return 'Aplikasi Kasir';
     }
@@ -919,8 +1422,20 @@ export default function App() {
         <View>
           <Text style={styles.headerText}>{getHeaderTitle()}</Text>
           <Text style={{color: '#94a3b8', fontSize: 12}}>{user?.name} | {user?.roles?.[0]}</Text>
+          {currentShift && (
+            <Text style={{color: '#bbf7d0', fontSize: 10, marginTop: 2}}>
+              Shift Aktif (Mulai: {new Date(currentShift.start_time).toLocaleTimeString('id-ID')})
+            </Text>
+          )}
         </View>
-        <TouchableOpacity onPress={handleLogout}><LogOut size={20} color="#fff" /></TouchableOpacity>
+        <View style={{flexDirection: 'row', alignItems: 'center', gap: 16}}>
+          {currentShift && (user?.roles?.[0] === 'Kasir' || user?.roles?.[0] === 'Kasir Cabang') && (
+            <TouchableOpacity onPress={() => setShowCloseShiftModal(true)} style={{backgroundColor: '#ef4444', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6}}>
+              <Text style={{color: '#fff', fontSize: 10, fontWeight: 'bold'}}>Tutup Shift</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity onPress={handleLogout}><LogOut size={20} color="#fff" /></TouchableOpacity>
+        </View>
       </View>
 
       <View style={styles.content}>
@@ -1202,6 +1717,368 @@ export default function App() {
           </View>
         )}
 
+        {activeTab === 'lost' && (
+          <View style={{ flex: 1 }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 }}>
+               <Text style={{ fontWeight: 'bold', fontSize: 16 }}>Daftar Kejadian</Text>
+               <TouchableOpacity 
+                style={{ backgroundColor: '#3b82f6', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, flexDirection: 'row', alignItems: 'center', gap: 6 }}
+                onPress={() => setShowLostModal(true)}
+               >
+                 <Plus size={16} color="#fff" />
+                 <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 12 }}>Tambah Laporan</Text>
+               </TouchableOpacity>
+            </View>
+            
+            <FlashList
+              data={lostList}
+              keyExtractor={(item, index) => item.id?.toString() || index.toString()}
+              renderItem={({ item }) => (
+                <View style={styles.productCard}>
+                  <View style={styles.pInfo}>
+                    <Text style={styles.pName}>{item.product_name}</Text>
+                    <Text style={{ fontSize: 11, color: '#64748b' }}>{formatDate(item.reported_at)}</Text>
+                    {item.note ? <Text style={{ fontSize: 11, color: '#94a3b8', fontStyle: 'italic' }}>"{item.note}"</Text> : null}
+                  </View>
+                  <View style={styles.pRight}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                       <Text style={{ fontWeight: 'bold', color: item.loss_type === 'hilang' ? '#ef4444' : '#eab308', fontSize: 12 }}>
+                         {item.qty} {(item.loss_type || 'hilang').toUpperCase()}
+                       </Text>
+                    </View>
+                    <View style={{ marginTop: 4 }}>
+                      {item.synced === 1 ? (
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                          <CheckCircle size={10} color="#22c55e" />
+                          <Text style={{ fontSize: 10, color: '#22c55e' }}>Synced</Text>
+                        </View>
+                      ) : (
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                          <RefreshCw size={10} color="#94a3b8" />
+                          <Text style={{ fontSize: 10, color: '#94a3b8' }}>Pending</Text>
+                        </View>
+                      )}
+                    </View>
+                  </View>
+                </View>
+              )}
+              estimatedItemSize={80}
+              ListEmptyComponent={
+                <View style={{ alignItems: 'center', marginTop: 50 }}>
+                  <AlertTriangle size={48} color="#e2e8f0" />
+                  <Text style={{ color: '#94a3b8', marginTop: 10 }}>Belum ada laporan barang hilang/rusak.</Text>
+                </View>
+              }
+            />
+          </View>
+        )}
+
+        {activeTab === 'expense' && (
+          <ExpenseScreen selectedBranch={selectedBranch} navigation={{ goBack: () => setActiveTab('expenseHistory'), navigate: (route) => setActiveTab(route === 'ExpenseHistory' ? 'expenseHistory' : 'dashboard') }} />
+        )}
+
+        {activeTab === 'expenseHistory' && (
+          <ExpenseHistoryScreen selectedBranch={selectedBranch} navigation={{ goBack: () => setActiveTab('dashboard'), navigate: (route) => setActiveTab(route === 'ExpenseInput' ? 'expense' : 'dashboard') }} />
+        )}
+
+        {activeTab === 'riwayat' && (
+          <View style={{ flex: 1 }}>
+            {/* Recap Button */}
+            <TouchableOpacity
+              style={{
+                backgroundColor: '#2563eb',
+                padding: 12,
+                borderRadius: 10,
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'center',
+                marginBottom: 12,
+                gap: 8,
+              }}
+              onPress={() => setActiveTab('recap')}
+            >
+              <BarChart3 size={18} color="#fff" />
+              <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 14 }}>Lihat Rekap Penjualan</Text>
+            </TouchableOpacity>
+
+            {/* Filter */}
+            <View style={styles.filterRow}>
+              {['all', 'today', 'month', 'voided'].map((f) => (
+                <TouchableOpacity key={f} onPress={() => { setSalesFilter(f); setSalesPage(1); }} style={[styles.filterBtn, salesFilter === f && styles.activeFilter]}>
+                  <Text style={salesFilter === f ? styles.activeFilterText : styles.filterText}>
+                    {f === 'all' ? 'Semua' : f === 'today' ? 'Hari Ini' : f === 'month' ? 'Bulan Ini' : 'Void'}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {/* Search */}
+            <View style={styles.searchBar}>
+              <Search size={20} color="#666" />
+              <TextInput style={styles.searchInput} placeholder="Cari invoice..." value={salesSearch} onChangeText={(t) => { setSalesSearch(t); setSalesPage(1); }} />
+            </View>
+
+            {/* Sales Table */}
+            <View style={styles.tableHeader}>
+              <Text style={[styles.th, { width: 32 }]}>#</Text>
+              <Text style={[styles.th, { flex: 2 }]}>Invoice</Text>
+              <Text style={[styles.th, { flex: 1.5 }]}>Total</Text>
+              <Text style={[styles.th, { flex: 1 }]}>Status</Text>
+              <Text style={[styles.th, { flex: 1.5 }]}>Tanggal</Text>
+              <Text style={[styles.th, { flex: 1, textAlign: 'center' }]}>Aksi</Text>
+            </View>
+
+            <FlashList 
+              data={useMemo(() => {
+                let filtered = salesList;
+                if (salesFilter === 'today') {
+                  const today = new Date().toISOString().split('T')[0];
+                  filtered = filtered.filter(s => (s.created_at || '').startsWith(today));
+                } else if (salesFilter === 'month') {
+                  const thisMonth = new Date().toISOString().substring(0, 7);
+                  filtered = filtered.filter(s => (s.created_at || '').startsWith(thisMonth));
+                } else if (salesFilter === 'voided') {
+                  filtered = filtered.filter(s => s.status === 'voided' || s.status === 'void_pending');
+                }
+                if (salesSearch) {
+                  filtered = filtered.filter(s => (s.invoice_number || '').toLowerCase().includes(salesSearch.toLowerCase()));
+                }
+                const start = (salesPage - 1) * salesPerPage;
+                return filtered.slice(start, start + salesPerPage);
+              }, [salesList, salesFilter, salesSearch, salesPage, salesPerPage])}
+              keyExtractor={item => String(item.id)}
+              estimatedItemSize={55}
+              renderItem={({ item, index }) => {
+                const globalIdx = (salesPage - 1) * salesPerPage + index + 1;
+                return (
+                  <TouchableOpacity 
+                    style={styles.tableRow} 
+                    onPress={async () => {
+                      setSelectedSale(item);
+                      await loadSaleDetail(item.id);
+                      setShowSaleDetail(true);
+                    }}
+                  >
+                    <Text style={[styles.td, { width: 32, color: '#94a3b8', fontSize: 11, textAlign: 'center' }]}>{globalIdx}</Text>
+                    <Text style={[styles.td, { flex: 2, fontWeight: '600', fontSize: 12, color: '#0f172a' }]} numberOfLines={1}>
+                      {item.invoice_number}
+                    </Text>
+                    <Text style={[styles.td, { flex: 1.5, fontWeight: '600', color: '#3b82f6', fontSize: 12 }]}>
+                      {formatRp(item.total)}
+                    </Text>
+                    <View style={[styles.td, { flex: 1 }]}>
+                      <View style={[styles.statusBadge, { 
+                        backgroundColor: item.status === 'completed' ? '#dcfce7' : item.status === 'voided' || item.status === 'void_pending' ? '#fee2e2' : '#fef9c7'
+                      }]}>
+                        <Text style={[styles.statusText, {
+                          color: item.status === 'completed' ? '#15803d' : item.status === 'voided' || item.status === 'void_pending' ? '#dc2626' : '#a16207'
+                        }]}>
+                          {item.status === 'completed' ? 'LUNAS' : item.status === 'voided' ? 'VOID' : item.status === 'void_pending' ? 'VOID PENDING' : (item.status || 'PENDING')}
+                        </Text>
+                      </View>
+                    </View>
+                    <Text style={[styles.td, { flex: 1.5, fontSize: 11, color: '#64748b' }]} numberOfLines={1}>
+                      {formatDate(item.created_at)}
+                    </Text>
+                    <View style={[styles.td, { flex: 1, alignItems: 'center' }]}>
+                      {item.status !== 'voided' && item.status !== 'void_pending' ? (
+                        <TouchableOpacity 
+                          style={[styles.acceptBtn, { backgroundColor: '#fee2e2' }]}
+                          onPress={(e) => { e.stopPropagation(); voidSale(item); }}
+                          disabled={voidLoading}
+                        >
+                          {voidLoading ? <ActivityIndicator size={14} color="#dc2626" /> : <Ban size={16} color="#dc2626" />}
+                        </TouchableOpacity>
+                      ) : (
+                        <Text style={{ fontSize: 11, color: '#cbd5e1' }}>-</Text>
+                      )}
+                    </View>
+                  </TouchableOpacity>
+                );
+              }}
+              ListEmptyComponent={
+                <View style={{ padding: 30, alignItems: 'center' }}>
+                  <FileText size={40} color="#cbd5e1" />
+                  <Text style={{ marginTop: 10, color: '#94a3b8', textAlign: 'center' }}>Tidak ada riwayat penjualan</Text>
+                </View>
+              }
+            />
+
+            {/* Pagination */}
+            {(() => {
+              let filtered = salesList;
+              if (salesFilter === 'today') {
+                const today = new Date().toISOString().split('T')[0];
+                filtered = filtered.filter(s => (s.created_at || '').startsWith(today));
+              } else if (salesFilter === 'month') {
+                const thisMonth = new Date().toISOString().substring(0, 7);
+                filtered = filtered.filter(s => (s.created_at || '').startsWith(thisMonth));
+              } else if (salesFilter === 'voided') {
+                filtered = filtered.filter(s => s.status === 'voided' || s.status === 'void_pending');
+              }
+              if (salesSearch) {
+                filtered = filtered.filter(s => (s.invoice_number || '').toLowerCase().includes(salesSearch.toLowerCase()));
+              }
+              const totalPages = Math.ceil(filtered.length / salesPerPage) || 1;
+              if (filtered.length === 0) return null;
+              return (
+                <View style={styles.paginationRow}>
+                  <TouchableOpacity 
+                    disabled={salesPage === 1}
+                    onPress={() => setSalesPage(prev => Math.max(1, prev - 1))}
+                    style={[styles.pageBtn, salesPage === 1 && styles.pageBtnDisabled]}
+                  >
+                    <ChevronLeft size={20} color={salesPage === 1 ? '#cbd5e1' : '#0f172a'} />
+                  </TouchableOpacity>
+                  <Text style={styles.pageInfo}>Hal {salesPage} dari {totalPages}</Text>
+                  <TouchableOpacity 
+                    disabled={salesPage === totalPages}
+                    onPress={() => setSalesPage(prev => Math.min(totalPages, prev + 1))}
+                    style={[styles.pageBtn, salesPage === totalPages && styles.pageBtnDisabled]}
+                  >
+                    <ChevronRight size={20} color={salesPage === totalPages ? '#cbd5e1' : '#0f172a'} />
+                  </TouchableOpacity>
+                </View>
+              );
+            })()}
+          </View>
+        )}
+
+        {activeTab === 'shift' && (
+          <ShiftHistoryScreen navigation={{ goBack: () => setActiveTab('dashboard'), navigate: (route) => setActiveTab('dashboard') }} />
+        )}
+
+        {activeTab === 'retur' && (
+          <SalesReturnScreen 
+            navigation={{ goBack: () => setActiveTab('dashboard') }} 
+          />
+        )}
+
+        {activeTab === 'recap' && (
+          <DailySalesRecapScreen
+            selectedBranch={selectedBranch}
+            navigation={{ goBack: () => setActiveTab('riwayat') }}
+          />
+        )}
+
+        {activeTab === 'returForm' && selectedSaleForReturn && (
+          <ReturnFormScreen 
+            sale={selectedSaleForReturn}
+            saleItems={saleDetailItems}
+            navigation={{ goBack: () => setActiveTab('retur') }}
+            onSuccess={() => {
+              setActiveTab('riwayat');
+              setSelectedSaleForReturn(null);
+              setShowSaleDetail(false);
+              loadSales();
+            }}
+          />
+        )}
+
+        {activeTab === 'purchaseOrder' && (
+          <PurchaseOrderScreen 
+            selectedBranch={selectedBranch} 
+            navigation={{ 
+              goBack: () => setActiveTab('dashboard'), 
+              navigate: (route, params) => {
+                if (route === 'PurchaseOrderDetail') {
+                  setSelectedPO(params?.purchaseOrder);
+                  setActiveTab('purchaseOrderDetail');
+                } else if (route === 'PurchaseOrderForm') {
+                  setEditPO(null);
+                  setActiveTab('purchaseOrderForm');
+                }
+              } 
+            }} 
+          />
+        )}
+
+        {activeTab === 'purchaseOrderDetail' && (
+          <PurchaseOrderDetailScreen 
+            purchaseOrderId={selectedPO?.id}
+            route={{ params: { purchaseOrder: selectedPO } }}
+            navigation={{ 
+              goBack: () => setActiveTab('purchaseOrder'),
+              navigate: (route, params) => {
+                if (route === 'PurchaseOrderForm') {
+                  setEditPO(selectedPO);
+                  setActiveTab('purchaseOrderForm');
+                }
+              }
+            }} 
+          />
+        )}
+
+        {activeTab === 'purchaseOrderForm' && (
+          <PurchaseOrderFormScreen 
+            selectedBranch={selectedBranch}
+            editPurchaseOrder={editPO}
+            navigation={{ 
+              goBack: () => setActiveTab('purchaseOrder')
+            }} 
+          />
+        )}
+
+        {activeTab === 'purchaseReturns' && (
+          <PurchaseReturnListScreen 
+            navigation={{
+              navigate: (route) => {
+                if (route === 'PurchaseReturnForm') setActiveTab('purchaseReturnForm');
+              }
+            }}
+          />
+        )}
+
+        {activeTab === 'purchaseReturnForm' && (
+          <PurchaseReturnFormScreen 
+            navigation={{
+              goBack: () => setActiveTab('purchaseReturns')
+            }}
+            onSuccess={() => setActiveTab('purchaseReturns')}
+          />
+        )}
+
+        {activeTab === 'stokOpname' && (
+          <StokOpnameListScreen 
+            selectedBranch={selectedBranch} 
+            navigation={{ 
+              goBack: () => setActiveTab('dashboard'), 
+              navigate: (route, params) => {
+                if (route === 'StokOpnameDetail') {
+                  setSelectedStokOpnameId(params?.stokOpnameId);
+                  setActiveTab('stokOpnameDetail');
+                } else if (route === 'StokOpnameForm') {
+                  setActiveTab('stokOpnameForm');
+                }
+              } 
+            }} 
+          />
+        )}
+
+        {activeTab === 'stokOpnameDetail' && (
+          <StokOpnameDetailScreen 
+            stokOpnameId={selectedStokOpnameId}
+            navigation={{ 
+              goBack: () => setActiveTab('stokOpname')
+            }} 
+          />
+        )}
+
+        {activeTab === 'stokOpnameForm' && (
+          <StokOpnameFormScreen 
+            selectedBranch={selectedBranch}
+            navigation={{ 
+              goBack: () => setActiveTab('stokOpname')
+            }} 
+          />
+        )}
+
+        {activeTab === 'pelanggan' && (
+          <CustomerScreen
+            navigation={{ goBack: () => setActiveTab('dashboard') }}
+          />
+        )}
+
         {activeTab === 'settings' && (
           <ScrollView style={styles.settings} contentContainerStyle={{ paddingBottom: 40 }}>
             <View style={styles.settingCard}>
@@ -1272,7 +2149,7 @@ export default function App() {
                     style={styles.settingInput} 
                     value={storeName} 
                     onChangeText={setStoreName} 
-                    onBlur={async () => await SecureStore.setItemAsync('store_name', storeName)} 
+                    onBlur={async () => await Storage.setItemAsync('store_name', storeName)} 
                   />
                   
                   <Text style={[styles.settingLabel, {marginTop: 10}]}>No Kontak</Text>
@@ -1281,7 +2158,7 @@ export default function App() {
                     value={storeContact} 
                     onChangeText={setStoreContact} 
                     keyboardType="phone-pad"
-                    onBlur={async () => await SecureStore.setItemAsync('store_contact', storeContact)} 
+                    onBlur={async () => await Storage.setItemAsync('store_contact', storeContact)} 
                   />
                   
                   <Text style={[styles.settingLabel, {marginTop: 10}]}>Footer (Ucapan)</Text>
@@ -1289,7 +2166,7 @@ export default function App() {
                     style={styles.settingInput} 
                     value={storeFooter} 
                     onChangeText={setStoreFooter} 
-                    onBlur={async () => await SecureStore.setItemAsync('store_footer', storeFooter)} 
+                    onBlur={async () => await Storage.setItemAsync('store_footer', storeFooter)} 
                   />
                 </View>
               </View>
@@ -1317,7 +2194,7 @@ export default function App() {
                         style={[styles.printerBtn, printerSize === size && styles.activePrinterBtn]}
                         onPress={async () => {
                           setPrinterSize(size);
-                          await SecureStore.setItemAsync('printer_size', size);
+                          await Storage.setItemAsync('printer_size', size);
                         }}
                       >
                         <Text style={[styles.printerBtnText, printerSize === size && styles.activePrinterBtnText]}>{size}mm</Text>
@@ -1420,6 +2297,105 @@ export default function App() {
                 <Text style={{ textAlign: 'center', marginTop: 50, color: '#94a3b8' }}>Tidak ada produk</Text>
               }
             />
+          </View>
+        </Modal>
+
+        {/* Modal Laporan Barang Hilang/Rusak */}
+        <Modal visible={showLostModal} animationType="slide" onRequestClose={() => setShowLostModal(false)}>
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Lapor Barang Kejadian</Text>
+              <TouchableOpacity onPress={() => setShowLostModal(false)}>
+                <Text style={styles.modalClose}>Batal</Text>
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={{ padding: 15 }}>
+              {!selectedProductForLost ? (
+                <View>
+                  <Text style={styles.formLabel}>Pilih Produk:</Text>
+                  <View style={styles.searchBar}>
+                    <Search size={20} color="#666" />
+                    <TextInput 
+                      style={styles.searchInput} 
+                      placeholder="Cari produk..." 
+                      value={modalProductSearch} 
+                      onChangeText={setModalProductSearch} 
+                    />
+                  </View>
+                  <View style={{ height: 300, backgroundColor: '#f8fafc', borderRadius: 8 }}>
+                    <FlashList
+                      data={products.filter(p => p.name.toLowerCase().includes(modalProductSearch.toLowerCase()))}
+                      keyExtractor={item => item.id}
+                      renderItem={({ item }) => (
+                        <TouchableOpacity 
+                          style={{ padding: 12, borderBottomWidth: 1, borderColor: '#e2e8f0' }}
+                          onPress={() => { setSelectedProductForLost(item); setModalProductSearch(''); }}
+                        >
+                          <Text style={{ fontWeight: 'bold', color: '#0f172a' }}>{item.name}</Text>
+                          <Text style={{ fontSize: 12, color: '#64748b' }}>Stok: {item.stock} {item.unit}</Text>
+                        </TouchableOpacity>
+                      )}
+                      estimatedItemSize={60}
+                    />
+                  </View>
+                </View>
+              ) : (
+                <View>
+                  <View style={{ backgroundColor: '#e2e8f0', padding: 12, borderRadius: 8, marginBottom: 15 }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <View>
+                        <Text style={{ fontWeight: 'bold', color: '#0f172a' }}>{selectedProductForLost.name}</Text>
+                        <Text style={{ fontSize: 12, color: '#64748b' }}>Stok saat ini: {selectedProductForLost.stock}</Text>
+                      </View>
+                      <TouchableOpacity onPress={() => setSelectedProductForLost(null)}>
+                        <Text style={{ color: '#ef4444', fontWeight: 'bold', fontSize: 12 }}>Ganti</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  <Text style={styles.formLabel}>Jumlah (Qty):</Text>
+                  <TextInput
+                    style={{ backgroundColor: '#fff', borderWidth: 1, borderColor: '#cbd5e1', borderRadius: 8, padding: 12, fontSize: 16, marginBottom: 15 }}
+                    keyboardType="numeric"
+                    value={lostQty}
+                    onChangeText={setLostQty}
+                  />
+
+                  <Text style={styles.formLabel}>Jenis Kejadian:</Text>
+                  <View style={{ flexDirection: 'row', gap: 10, marginBottom: 15 }}>
+                    <TouchableOpacity 
+                      style={{ flex: 1, padding: 12, borderRadius: 8, alignItems: 'center', backgroundColor: lossType === 'hilang' ? '#ef4444' : '#e2e8f0' }}
+                      onPress={() => setLossType('hilang')}
+                    >
+                      <Text style={{ fontWeight: 'bold', color: lossType === 'hilang' ? '#fff' : '#64748b' }}>HILANG</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity 
+                      style={{ flex: 1, padding: 12, borderRadius: 8, alignItems: 'center', backgroundColor: lossType === 'rusak' ? '#eab308' : '#e2e8f0' }}
+                      onPress={() => setLossType('rusak')}
+                    >
+                      <Text style={{ fontWeight: 'bold', color: lossType === 'rusak' ? '#fff' : '#64748b' }}>RUSAK</Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  <Text style={styles.formLabel}>Keterangan (opsional):</Text>
+                  <TextInput
+                    style={{ backgroundColor: '#fff', borderWidth: 1, borderColor: '#cbd5e1', borderRadius: 8, padding: 12, fontSize: 16, marginBottom: 25, height: 80, textAlignVertical: 'top' }}
+                    multiline
+                    value={lostNote}
+                    onChangeText={setLostNote}
+                    placeholder="Contoh: Jatuh pecah, hilang dicuri..."
+                  />
+
+                  <TouchableOpacity 
+                    style={[styles.submitTransferBtn, { opacity: loading ? 0.7 : 1 }]} 
+                    onPress={reportLost}
+                    disabled={loading}
+                  >
+                    {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitTransferBtnText}>SIMPAN LAPORAN</Text>}
+                  </TouchableOpacity>
+                </View>
+              )}
+            </ScrollView>
           </View>
         </Modal>
 
@@ -1561,18 +2537,414 @@ export default function App() {
       </View>
 
       {cart.length > 0 && activeTab === 'kasir' && (
-        <TouchableOpacity style={styles.cartBar} onPress={checkout}>
-          <Text style={styles.cartText}>{cart.length} Item | {formatRp(cart.reduce((s, i) => s + (i.sell_price * i.qty), 0))}</Text>
-          <Text style={styles.checkoutText}>BAYAR</Text>
+        <View>
+          {/* Customer selection bar */}
+          <TouchableOpacity 
+            style={styles.customerSelectBar}
+            onPress={() => setShowCustomerPicker(true)}
+          >
+            <User size={16} color={selectedCustomer ? '#eab308' : '#94a3b8'} />
+            <Text style={[styles.customerSelectText, selectedCustomer && styles.customerSelectTextActive]}>
+              {selectedCustomer ? `${selectedCustomer.name} ★ ${formatNumber(selectedCustomer.poin || 0)} poin` : 'Pilih Pelanggan (opsional)'}
+            </Text>
+            {selectedCustomer && (
+              <TouchableOpacity onPress={() => setSelectedCustomer(null)}>
+                <X size={16} color="#ef4444" />
+              </TouchableOpacity>
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.cartBar} onPress={() => setShowCartModal(true)}>
+          <Text style={styles.cartText}>
+            {cart.length} Item | {formatRp(cart.reduce((s, i) => {
+              const bp = i.price_override != null ? i.price_override : i.sell_price;
+              const lt = bp * i.qty;
+              let dv = Number(i.discount_value) || 0;
+              let dt = i.discount_type || 'none';
+              if (dt === 'percent' && dv > 0) return s + (lt - (lt * dv / 100));
+              if (dt === 'flat' && dv > 0) return s + Math.max(0, lt - dv);
+              return s + lt;
+            }, 0))}
+          </Text>
+          <Text style={styles.checkoutText}>LANJUT BAYAR</Text>
         </TouchableOpacity>
+        </View>
       )}
+
+      {/* POS Cart Modal with Discount & Override */}
+      <Modal visible={showCartModal} animationType="slide" onRequestClose={() => setShowCartModal(false)}>
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Keranjang Transaksi</Text>
+            <TouchableOpacity onPress={() => setShowCartModal(false)}>
+              <Text style={styles.modalClose}>Batal</Text>
+            </TouchableOpacity>
+          </View>
+          
+          <FlashList 
+            data={cart}
+            keyExtractor={item => item.id}
+            estimatedItemSize={120}
+            renderItem={({ item }) => {
+              const basePrice = item.price_override != null ? item.price_override : item.sell_price;
+              const lineTotal = basePrice * item.qty;
+              let dv = Number(item.discount_value) || 0;
+              let dt = item.discount_type || 'none';
+              let finalSub = lineTotal;
+              if (dt === 'percent' && dv > 0) finalSub = lineTotal - (lineTotal * dv / 100);
+              else if (dt === 'flat' && dv > 0) finalSub = Math.max(0, lineTotal - dv);
+
+              return (
+                <View style={[styles.cartItemRow, { flexDirection: 'column', alignItems: 'stretch' }]}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.cartItemName} numberOfLines={1}>{item.name}</Text>
+                      <Text style={styles.cartItemUnit}>
+                        {formatRp(basePrice)} {item.price_override != null ? '(Override)' : ''}
+                      </Text>
+                    </View>
+                    <View style={styles.qtyContainer}>
+                      <TouchableOpacity style={styles.qtyBtn} onPress={() => {
+                        if (item.qty <= 1) removeFromCart(item.id);
+                        else setCart(prev => prev.map(i => i.id === item.id ? { ...i, qty: i.qty - 1 } : i));
+                      }}>
+                        <Text style={styles.qtyBtnText}>-</Text>
+                      </TouchableOpacity>
+                      <Text style={styles.qtyVal}>{item.qty}</Text>
+                      <TouchableOpacity style={styles.qtyBtn} onPress={() => {
+                        setCart(prev => prev.map(i => i.id === item.id ? { ...i, qty: i.qty + 1 } : i));
+                      }}>
+                        <Text style={styles.qtyBtnText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <TouchableOpacity style={styles.removeCartItemBtn} onPress={() => removeFromCart(item.id)}>
+                      <Trash2 size={18} color="#ef4444" />
+                    </TouchableOpacity>
+                  </View>
+
+                  {/* Settings for per-item: Price Override & Discount */}
+                  <View style={{ marginTop: 10, padding: 8, backgroundColor: '#f8fafc', borderRadius: 8 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
+                      <Text style={{ fontSize: 12, color: '#64748b', width: 80 }}>Harga Baru:</Text>
+                      <TextInput 
+                        style={[styles.settingInput, { flex: 1, marginTop: 0, paddingVertical: 4, height: 32 }]} 
+                        placeholder={String(item.sell_price)}
+                        keyboardType="numeric"
+                        value={item.price_override != null ? String(item.price_override) : ''}
+                        onChangeText={(txt) => {
+                          if (txt === '') updateCartItemPriceOverride(item.id, null);
+                          else updateCartItemPriceOverride(item.id, parseFloat(txt));
+                        }}
+                      />
+                    </View>
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <Text style={{ fontSize: 12, color: '#64748b', width: 80 }}>Diskon:</Text>
+                      <View style={{ flexDirection: 'row', flex: 1, gap: 4 }}>
+                        <TouchableOpacity 
+                          style={[styles.subTabBtn, { flex: 1, paddingVertical: 4 }, item.discount_type === 'none' && styles.subTabBtnActive]}
+                          onPress={() => updateCartItemDiscount(item.id, 'discount_type', 'none')}
+                        >
+                          <Text style={[styles.subTabBtnText, { fontSize: 10 }, item.discount_type === 'none' && styles.subTabBtnTextActive]}>None</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity 
+                          style={[styles.subTabBtn, { flex: 1, paddingVertical: 4 }, item.discount_type === 'percent' && styles.subTabBtnActive]}
+                          onPress={() => updateCartItemDiscount(item.id, 'discount_type', 'percent')}
+                        >
+                          <Text style={[styles.subTabBtnText, { fontSize: 10 }, item.discount_type === 'percent' && styles.subTabBtnTextActive]}>%</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity 
+                          style={[styles.subTabBtn, { flex: 1, paddingVertical: 4 }, item.discount_type === 'flat' && styles.subTabBtnActive]}
+                          onPress={() => updateCartItemDiscount(item.id, 'discount_type', 'flat')}
+                        >
+                          <Text style={[styles.subTabBtnText, { fontSize: 10 }, item.discount_type === 'flat' && styles.subTabBtnTextActive]}>Flat</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                    {item.discount_type !== 'none' && (
+                      <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8 }}>
+                        <Text style={{ fontSize: 12, color: '#64748b', width: 80 }}>Nilai Diskon:</Text>
+                        <TextInput 
+                          style={[styles.settingInput, { flex: 1, marginTop: 0, paddingVertical: 4, height: 32 }]} 
+                          placeholder={item.discount_type === 'percent' ? "e.g. 10 for 10%" : "e.g. 5000"}
+                          keyboardType="numeric"
+                          value={item.discount_value ? String(item.discount_value) : ''}
+                          onChangeText={(txt) => updateCartItemDiscount(item.id, 'discount_value', parseFloat(txt) || 0)}
+                        />
+                      </View>
+                    )}
+                    <View style={{ marginTop: 8, alignItems: 'flex-end' }}>
+                      <Text style={{ fontSize: 13, fontWeight: 'bold', color: '#0f172a' }}>Subtotal: {formatRp(finalSub)}</Text>
+                    </View>
+                  </View>
+                </View>
+              );
+            }}
+            ListEmptyComponent={
+              <View style={{ alignItems: 'center', marginTop: 30 }}>
+                <Text style={{ color: '#94a3b8', fontSize: 13 }}>Keranjang Kosong</Text>
+              </View>
+            }
+          />
+          <View style={{ marginTop: 10, marginBottom: 20 }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingBottom: 8, borderBottomWidth: 1, borderColor: '#e2e8f0', marginBottom: 8 }}>
+              <Text style={{ fontSize: 16, fontWeight: 'bold' }}>Total Bayar</Text>
+              <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#3b82f6' }}>
+                {formatRp(getCartTotal())}
+              </Text>
+            </View>
+
+            {/* Multi-payment methods */}
+            <View style={{ marginBottom: 10 }}>
+              <Text style={{ fontSize: 13, fontWeight: '600', color: '#475569', marginBottom: 6 }}>Metode Pembayaran</Text>
+              {payments.length === 0 ? (
+                <Text style={{ fontSize: 12, color: '#94a3b8', fontStyle: 'italic' }}>
+                  (akan menggunakan Tunai / CASH)
+                </Text>
+              ) : (
+                payments.map((p, idx) => (
+                  <View key={idx} style={{
+                    flexDirection: 'row', alignItems: 'center', backgroundColor: '#f8fafc',
+                    padding: 8, borderRadius: 8, marginBottom: 4, borderWidth: 1, borderColor: '#e2e8f0'
+                  }}>
+                    <Text style={{ flex: 1, fontSize: 13, color: '#1e293b' }}>{p.payment_method_id}</Text>
+                    <TextInput
+                      style={{
+                        width: 90, backgroundColor: '#fff', borderRadius: 6, paddingVertical: 4, paddingHorizontal: 8,
+                        fontSize: 13, borderWidth: 1, borderColor: '#e2e8f0', textAlign: 'right'
+                      }}
+                      keyboardType="numeric"
+                      value={String(p.amount)}
+                      onChangeText={(txt) => {
+                        const val = parseFloat(txt) || 0;
+                        setPayments(prev => prev.map((pm, i) => i === idx ? { ...pm, amount: val } : pm));
+                      }}
+                    />
+                    <TouchableOpacity
+                      style={{ marginLeft: 6, padding: 4 }}
+                      onPress={() => {
+                        setPayments(prev => prev.filter((_, i) => i !== idx));
+                      }}
+                    >
+                      <Trash2 size={16} color="#ef4444" />
+                    </TouchableOpacity>
+                  </View>
+                ))
+              )}
+              
+              <TouchableOpacity
+                style={{
+                  flexDirection: 'row', alignItems: 'center', backgroundColor: '#eff6ff',
+                  padding: 10, borderRadius: 8, borderWidth: 1, borderColor: '#bfdbfe',
+                  marginTop: 6, gap: 6
+                }}
+                onPress={() => setShowPaymentPicker(true)}
+              >
+                <Plus size={16} color="#3b82f6" />
+                <Text style={{ fontSize: 13, color: '#3b82f6', fontWeight: '600' }}>Tambah Metode Bayar</Text>
+              </TouchableOpacity>
+              {payments.length > 0 && (
+                <Text style={{
+                  fontSize: 11, color: Math.abs(payments.reduce((s, p) => s + p.amount, 0) - getCartTotal()) < 0.01 ? '#22c55e' : '#ef4444',
+                  marginTop: 4, fontWeight: '500'
+                }}>
+                  {Math.abs(payments.reduce((s, p) => s + p.amount, 0) - getCartTotal()) < 0.01
+                    ? '✓ Jumlah pas dengan total'
+                    : `Sisa: ${formatRp(getCartTotal() - payments.reduce((s, p) => s + p.amount, 0))}`
+                  }
+                </Text>
+              )}
+            </View>
+
+            <TouchableOpacity 
+              style={[styles.submitTransferBtn, cart.length === 0 && styles.submitTransferBtnDisabled, { marginTop: 0, marginBottom: 10 }]}
+              disabled={cart.length === 0}
+              onPress={() => {
+                setShowCartModal(false);
+                checkout();
+              }}
+            >
+              <Text style={styles.submitTransferBtnText}>SELESAIKAN PEMBAYARAN</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Payment Method Picker Modal */}
+      <PaymentMethodPicker
+        visible={showPaymentPicker}
+        selectedMethodId={null}
+        onSelect={(method) => {
+          const remaining = getCartTotal() - payments.reduce((s, p) => s + p.amount, 0);
+          setPayments(prev => [...prev, { payment_method_id: method.id, amount: Math.max(0, remaining) }]);
+        }}
+        onClose={() => setShowPaymentPicker(false)}
+      />
+
+      {/* Customer Picker Modal */}
+      <CustomerPicker
+        visible={showCustomerPicker}
+        onSelect={(customer) => setSelectedCustomer(customer)}
+        onClose={() => setShowCustomerPicker(false)}
+        selectedCustomerId={selectedCustomer?.id}
+      />
+
+      {/* Sale Detail Modal */}
+      <Modal visible={showSaleDetail} animationType="slide" onRequestClose={() => setShowSaleDetail(false)}>
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Detail Penjualan</Text>
+            <TouchableOpacity onPress={() => setShowSaleDetail(false)}>
+              <Text style={styles.modalClose}>Tutup</Text>
+            </TouchableOpacity>
+          </View>
+
+          {selectedSale && (
+            <View style={{ flex: 1 }}>
+              <View style={[styles.settingCard, { marginBottom: 15 }]}>
+                <Text style={{ fontSize: 16, fontWeight: 'bold', color: '#0f172a' }}>
+                  {selectedSale.invoice_number}
+                </Text>
+                <Text style={{ fontSize: 13, color: '#64748b', marginTop: 4 }}>
+                  Tanggal: {formatDate(selectedSale.created_at)}
+                </Text>
+                <Text style={{ fontSize: 13, color: '#64748b' }}>
+                  Pembayaran: {selectedSale.payment_method}
+                </Text>
+                {selectedSale.payments && selectedSale.payments.length > 0 && (
+                  <View style={{ marginTop: 4 }}>
+                    {(() => {
+                      let paymentsArr = selectedSale.payments;
+                      if (typeof paymentsArr === 'string') {
+                        try { paymentsArr = JSON.parse(paymentsArr); } catch(e) { paymentsArr = []; }
+                      }
+                      if (paymentsArr.length > 1) {
+                        return paymentsArr.map((pmt, idx) => (
+                          <Text key={idx} style={{ fontSize: 12, color: '#64748b', marginLeft: 8 }}>
+                            {`  ${pmt.payment_method_id}: ${formatRp(pmt.amount)}`}
+                          </Text>
+                        ));
+                      }
+                      return null;
+                    })()}
+                  </View>
+                )}
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8 }}>
+                  <Text style={{ fontSize: 13, color: '#64748b', marginRight: 6 }}>Status:</Text>
+                  <View style={[styles.statusBadge, { 
+                    backgroundColor: selectedSale.status === 'completed' ? '#dcfce7' : selectedSale.status === 'voided' || selectedSale.status === 'void_pending' ? '#fee2e2' : '#fef9c7'
+                  }]}>
+                    <Text style={[styles.statusText, {
+                      color: selectedSale.status === 'completed' ? '#15803d' : selectedSale.status === 'voided' || selectedSale.status === 'void_pending' ? '#dc2626' : '#a16207'
+                    }]}>
+                      {selectedSale.status === 'completed' ? 'LUNAS' : selectedSale.status === 'voided' ? 'VOID' : selectedSale.status === 'void_pending' ? 'VOID PENDING' : (selectedSale.status || 'PENDING')}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+
+              <Text style={styles.formLabel}>Daftar Barang:</Text>
+              <View style={{ flex: 1, backgroundColor: '#fff', borderRadius: 10, padding: 8, elevation: 1 }}>
+                <FlashList 
+                  data={saleDetailItems}
+                  keyExtractor={(item, index) => String(item.id || index)}
+                  estimatedItemSize={60}
+                  renderItem={({ item }) => (
+                    <View style={[styles.cartItemRow, { elevation: 0, borderBottomWidth: 1, borderColor: '#f1f5f9' }]}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.cartItemName}>{item.product_name}</Text>
+                        <Text style={styles.cartItemUnit}>
+                          {item.qty} x {formatRp(item.price)}
+                        </Text>
+                      </View>
+                      <Text style={{ fontSize: 14, fontWeight: 'bold', color: '#0f172a' }}>
+                        {formatRp(item.subtotal)}
+                      </Text>
+                    </View>
+                  )}
+                  ListEmptyComponent={
+                    <View style={{ alignItems: 'center', marginTop: 30 }}>
+                      <Text style={{ color: '#94a3b8', fontSize: 13 }}>Tidak ada item barang</Text>
+                    </View>
+                  }
+                />
+              </View>
+
+              <View style={{ marginTop: 15, paddingVertical: 15, borderTopWidth: 1, borderColor: '#e2e8f0', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                <Text style={{ fontSize: 16, fontWeight: 'bold' }}>Total Transaksi</Text>
+                <Text style={{ fontSize: 20, fontWeight: 'bold', color: '#3b82f6' }}>
+                  {formatRp(selectedSale.total)}
+                </Text>
+              </View>
+
+              {selectedSale.status !== 'voided' && selectedSale.status !== 'void_pending' && (
+                <View style={{ gap: 10, marginBottom: 20 }}>
+                  <TouchableOpacity 
+                    style={[styles.submitTransferBtn, { backgroundColor: '#3b82f6', marginTop: 10 }]}
+                    onPress={() => {
+                      setShowSaleDetail(false);
+                      setSelectedSaleForReturn(selectedSale);
+                      setActiveTab('returForm');
+                    }}
+                  >
+                    <Text style={styles.submitTransferBtnText}>RETUR BARANG</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity 
+                    style={[styles.submitTransferBtn, { backgroundColor: '#ef4444', marginTop: 0 }]}
+                    onPress={() => {
+                      setShowSaleDetail(false);
+                      voidSale(selectedSale);
+                    }}
+                    disabled={voidLoading}
+                  >
+                    <Text style={styles.submitTransferBtnText}>VOID TRANSAKSI</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+          )}
+        </View>
+      </Modal>
+
+      {/* Open Shift Modal */}
+      <Modal visible={showOpenShiftModal} animationType="fade" transparent onRequestClose={() => {}}>
+        <View style={{flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)'}}>
+          <OpenShiftScreen 
+            onShiftOpened={(shiftData) => {
+              setCurrentShift(shiftData || { status: 'open', start_time: new Date().toISOString() });
+              setShowOpenShiftModal(false);
+            }}
+          />
+        </View>
+      </Modal>
+
+      {/* Close Shift Modal */}
+      <Modal visible={showCloseShiftModal} animationType="fade" transparent onRequestClose={() => setShowCloseShiftModal(false)}>
+        <View style={{flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)'}}>
+          <CloseShiftScreen 
+            onShiftClosed={() => {
+              setCurrentShift(null);
+              setShowCloseShiftModal(false);
+            }}
+            onCancel={() => setShowCloseShiftModal(false)}
+          />
+        </View>
+      </Modal>
 
       <View style={styles.footer}>
         {[
           { id: 'dashboard', icon: LayoutDashboard, label: 'Dash' },
           { id: 'kasir', icon: ShoppingCart, label: 'Kasir' },
-          { id: 'transfer', icon: Package, label: 'Kiriman Stok' },
-          { id: 'settings', icon: Settings, label: 'Pengaturan' }
+          { id: 'transfer', icon: Package, label: 'Stok' },
+          { id: 'retur', icon: RotateCcw, label: 'Retur' },
+          { id: 'purchaseOrder', icon: ClipboardList, label: 'PO' },
+          { id: 'purchaseReturns', icon: RotateCcw, label: 'Retur Beli' },
+          { id: 'stokOpname', icon: ClipboardCheck, label: 'Opname' },
+          { id: 'lost', icon: AlertTriangle, label: 'Kejadian', action: () => { setActiveTab('lost'); loadLostHistory(); } },
+          { id: 'expenseHistory', icon: FileText, label: 'Biaya' },
+          { id: 'riwayat', icon: ScrollText, label: 'Riwayat' },
+          { id: 'pelanggan', icon: User, label: 'Pelanggan' },
+          { id: 'shift', icon: BookOpen, label: 'Shift' },
+          { id: 'settings', icon: Settings, label: 'Set' }
         ].map((item) => (
           <TouchableOpacity 
             key={item.id} 
@@ -1623,6 +2995,9 @@ const styles = StyleSheet.create({
   cartBar: { backgroundColor: '#3b82f6', margin: 15, padding: 12, borderRadius: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   cartText: { color: '#fff', fontWeight: 'bold', fontSize: 12 },
   checkoutText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+  customerSelectBar: { backgroundColor: '#f8fafc', marginHorizontal: 15, marginTop: 10, marginBottom: 0, padding: 10, borderRadius: 8, flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 1, borderColor: '#e2e8f0' },
+  customerSelectText: { flex: 1, fontSize: 13, color: '#94a3b8', fontWeight: '500' },
+  customerSelectTextActive: { color: '#a16207', fontWeight: 'bold' },
   footer: { height: 60, backgroundColor: '#fff', borderTopWidth: 1, borderColor: '#e2e8f0', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
   fItem: { alignItems: 'center', flex: 1 },
   buildVersion: { backgroundColor: '#fff', alignItems: 'center', paddingBottom: 5 },
@@ -1720,3 +3095,6 @@ const styles = StyleSheet.create({
   submitTransferBtnDisabled: { backgroundColor: '#94a3b8' },
   submitTransferBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
 });
+}
+
+
